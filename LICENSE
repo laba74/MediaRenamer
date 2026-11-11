@@ -19,3 +19,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Third-party software
+
+This MIT License applies only to the original MediaRenamer software and its
+associated documentation. It does not apply to third-party software that may
+be used or distributed with MediaRenamer. In particular, ExifTool is licensed
+separately under its own applicable license terms. When redistributing ExifTool,
+include its license and notices as required by those terms.
