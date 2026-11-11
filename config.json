@@ -1,0 +1,22 @@
+{
+  "filename_pattern": "{YYYY}-{MM}-{DD}_{HH}-{MIN}-{SEC}_{DEVICE}",
+  "supported_extensions": [
+    ".mp4",
+    ".mov",
+    ".lrv",
+    ".thm",
+    ".wav",
+    ".mp3",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".heic",
+    ".nef",
+    ".arw",
+    ".cr2",
+    ".cr3",
+    ".dng"
+  ],
+  "dry_run_by_default": true,
+  "log_level": "INFO"
+}
