@@ -149,5 +149,5 @@ Goal: validate error cases and platforms.
 
 ### Done — Epic 8
 - [x] `uv run pytest` is green on Windows and one POSIX system (locally on Windows; in CI on Ubuntu, macOS and Windows via `.github/workflows/tests.yml`).
-- [x] Every function in `media_renamer.py` has at least one test (enforced by `test_every_function_has_a_test`).
+- [x] Every function in `media_renamer.py` has at least one test (enforced by `test_every_function_has_a_test`, which checks that tests reference it, and `test_every_function_is_executed_by_the_tests`, which checks with `sys.monitoring` that it actually runs).
 - [x] End-to-end run on a mixed sample (photos, videos, GoPro files, unknown device) validated manually.

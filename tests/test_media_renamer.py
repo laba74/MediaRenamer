@@ -1,5 +1,6 @@
 """Unit tests for the ``media_renamer`` module."""
 
+import atexit
 import errno
 import inspect
 import io
@@ -10,9 +11,10 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import pytest
 
@@ -21,6 +23,53 @@ import media_renamer as mr
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXE_NAME = mr.exiftool_executable_name()
+# File name shared by the code objects of every function of ``media_renamer``.
+MODULE_CODE_FILE = mr.main.__code__.co_filename
+# Code objects of ``media_renamer`` started at least once during the test session.
+EXECUTED_CODE = set()  # type: Set[Any]
+
+
+def record_function_start(code: Any, offset: int) -> Any:
+    """
+    Record a function of ``media_renamer`` starting, then stop watching that code.
+
+    :param code: Code object of the starting function.
+    :param offset: Bytecode offset of the event (unused).
+    :return: ``sys.monitoring.DISABLE``: each code object only needs to be seen once.
+    """
+    if code.co_filename == MODULE_CODE_FILE:
+        EXECUTED_CODE.add(code)
+    return sys.monitoring.DISABLE
+
+
+def start_function_monitoring() -> Optional[int]:
+    """
+    Watch which functions start during the test session, with ``sys.monitoring``.
+
+    :return: The monitoring tool id used, or ``None`` when every id is taken (e.g. by a coverage tool).
+    """
+    for tool_id in (sys.monitoring.COVERAGE_ID, 3, 4):
+        if sys.monitoring.get_tool(tool_id) is None:
+            sys.monitoring.use_tool_id(tool_id, "media_renamer function coverage")
+            sys.monitoring.register_callback(tool_id, sys.monitoring.events.PY_START, record_function_start)
+            sys.monitoring.set_events(tool_id, sys.monitoring.events.PY_START)
+            atexit.register(stop_function_monitoring, tool_id)
+            return tool_id
+    return None
+
+
+def stop_function_monitoring(tool_id: int) -> None:
+    """
+    Stop watching functions and release the monitoring tool id (before the interpreter shuts down).
+
+    :param tool_id: Monitoring tool id returned by ``start_function_monitoring``.
+    """
+    sys.monitoring.set_events(tool_id, sys.monitoring.events.NO_EVENTS)
+    sys.monitoring.register_callback(tool_id, sys.monitoring.events.PY_START, None)
+    sys.monitoring.free_tool_id(tool_id)
+
+
+MONITORING_TOOL = start_function_monitoring()
 
 
 def make_device(**overrides: Any) -> Dict[str, Any]:
@@ -4262,4 +4311,36 @@ def test_every_function_has_a_test() -> None:
             pattern = r"\bmr\.{}\b".format(name)
         if not re.search(pattern, source):
             missing.append(qualified)
+    assert missing == []
+
+
+def test_function_monitoring_records_module_functions() -> None:
+    """
+    Check that the monitoring records the functions of ``media_renamer`` only.
+    """
+    if MONITORING_TOOL is None:
+        pytest.skip("no free sys.monitoring tool id")
+    mr.clean_text(" x ")
+    assert mr.clean_text.__code__ in EXECUTED_CODE
+    assert test_function_monitoring_records_module_functions.__code__ not in EXECUTED_CODE
+
+
+def test_every_function_is_executed_by_the_tests(request: pytest.FixtureRequest) -> None:
+    """
+    Check that every function and method of ``media_renamer`` really runs during the test session.
+
+    Stronger than ``test_every_function_has_a_test``, which only checks that tests mention each
+    function. It needs the whole test file, so it is skipped when tests are selected
+    (``-k``, node ids) or when it does not run last.
+
+    :param request: Pytest request, giving access to the selected tests.
+    """
+    if MONITORING_TOOL is None:
+        pytest.skip("no free sys.monitoring tool id")
+    module_tests = {name for name, value in globals().items() if name.startswith("test_") and callable(value)}
+    selected = {item.originalname for item in request.session.items}
+    if not module_tests <= selected or request.session.items[-1] is not request.node:
+        pytest.skip("needs the whole test file, run last")
+    executed = {code.co_qualname for code in EXECUTED_CODE}
+    missing = [name for name in list_module_functions() if name not in executed]
     assert missing == []
