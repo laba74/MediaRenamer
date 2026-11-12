@@ -73,7 +73,7 @@ Goal: compute the effective date used in names.
 Goal: build the target names once, shared by preview and apply.
 
 - **4.1 Name builder** — Render the pattern tokens, sanitize invalid characters deterministically.
-- **4.2 GoPro auxiliary files** — Link `.LRV` / `.THM` to the main video with the same base name in the same folder; reuse its date and device, keep extension; warn and skip if the main file is absent from that folder.
+- **4.2 GoPro auxiliary files** — Link `.LRV` / `.THM` (and `.WAV` "RAW audio" files named with a GoPro file id) to the main video with the same base name in the same folder, or else with the same GoPro file id ending the name (`GH011892`, `GL011892`, `GOPR2098`…), so names prefixed by another tool still match; reuse its date and device, keep extension; warn and skip if the main file is absent from that folder.
 - **4.3 Collision resolution** — Unique targets with `_01`, `_02`… before the extension, resolved per target directory; account for existing files and case-insensitive file systems.
 - **4.4 Plan model** — Immutable plan entries (source, target, action, warnings) produced by a single function.
 
@@ -81,6 +81,7 @@ Goal: build the target names once, shared by preview and apply.
 - [x] Same input always yields the same plan (determinism test).
 - [x] Tests: collisions inside the batch, with existing files, case-only differences.
 - [x] Tests: `.LRV`/`.THM` follow the main video; orphan auxiliary is warned and not renamed.
+- [x] Tests: auxiliary files and GoPro `.WAV` follow their main video by GoPro file id when prefixes differ.
 - [x] Tests: same base name in two different subfolders yields no cross-folder pairing and no cross-folder collision suffix.
 - [x] Plan generation touches no file.
 

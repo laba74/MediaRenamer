@@ -1491,6 +1491,10 @@ def test_analyze_file_statuses() -> None:
     forced = make_device(id="forced", label="Forced", match={"model": "Other"})
     aux = mr.analyze_file(Path("GL01.LRV"), None, "boom", devices)
     assert aux.status == mr.STATUS_AUXILIARY
+    gopro_audio = mr.analyze_file(Path("GH011905.WAV"), {}, None, devices)
+    assert gopro_audio.status == mr.STATUS_AUXILIARY
+    other_audio = mr.analyze_file(Path("interview.wav"), {}, None, devices)
+    assert other_audio.status == mr.STATUS_SKIPPED
     failed = mr.analyze_file(Path("a.jpg"), None, "File format error", devices)
     assert failed.status == mr.STATUS_SKIPPED and "File format error" in failed.message
     undated = mr.analyze_file(Path("a.jpg"), {"Make": "GoPro"}, None, devices)
@@ -1911,6 +1915,31 @@ def test_folder_key() -> None:
     assert mr.folder_key(Path("a.jpg")) == "."
 
 
+def test_gopro_file_id() -> None:
+    """
+    Check the GoPro file id at the end of a base name, with or without prefix.
+    """
+    assert mr.gopro_file_id("GH011892") == "gh011892"
+    assert mr.gopro_file_id("2025-07-14_19-19-24_2025-07-14_13-19-24_GL011892") == "gl011892"
+    assert mr.gopro_file_id("trip GOPR2098") == "gopr2098"
+    assert mr.gopro_file_id("GP010123") == "gp010123"
+    assert mr.gopro_file_id("XGH011892") is None
+    assert mr.gopro_file_id("GH011892_01") is None
+    assert mr.gopro_file_id("GH01189") is None
+    assert mr.gopro_file_id("holiday") is None
+
+
+def test_is_auxiliary_file() -> None:
+    """
+    Check that .LRV/.THM always follow a video and .WAV only with a GoPro file id.
+    """
+    assert mr.is_auxiliary_file(Path("a.LRV"))
+    assert mr.is_auxiliary_file(Path("sub/a.thm"))
+    assert mr.is_auxiliary_file(Path("prefix_GH011905.WAV"))
+    assert not mr.is_auxiliary_file(Path("interview.wav"))
+    assert not mr.is_auxiliary_file(Path("GH011905.MP4"))
+
+
 def test_main_video_stems() -> None:
     """
     Check the same-name candidate and the GoPro GL to GH/GX candidates.
@@ -1937,6 +1966,32 @@ def test_group_auxiliaries() -> None:
     assert "no main video" in orphans[Path("GOPR0003.THM")]
     assert "no main video" in orphans[Path("GL010009.LRV")]
     assert len(orphans) == 5
+
+
+def test_group_auxiliaries_by_gopro_file_id() -> None:
+    """
+    Check pairing by GoPro file id when another tool prefixed each name differently.
+    """
+    analyses = [
+        auxiliary("2025-07-14_17-19-26_GH011892.thm"), ready("2025-07-14_19-19-24_GH011892.mp4"),
+        auxiliary("2025-07-14_19-19-24_GL011892.lrv"), auxiliary("2025-07-15_18-25-20_GH011892.wav"),
+        auxiliary("2025-07-14_23-29-07_GL011898.lrv"), auxiliary("sub/x_GH011892.thm"),
+    ]
+    groups, orphans = mr.group_auxiliaries(analyses)
+    assert {main.as_posix(): [aux.relative.name for aux in auxes] for main, auxes in groups.items()} == {
+        "2025-07-14_19-19-24_GH011892.mp4": ["2025-07-14_17-19-26_GH011892.thm",
+                                             "2025-07-14_19-19-24_GL011892.lrv",
+                                             "2025-07-15_18-25-20_GH011892.wav"]}
+    assert set(orphans) == {Path("2025-07-14_23-29-07_GL011898.lrv"), Path("sub/x_GH011892.thm")}
+
+
+def test_group_auxiliaries_same_name_wins_over_file_id() -> None:
+    """
+    Check that an identical base name is preferred to a GoPro file id match.
+    """
+    analyses = [ready("a_GH010001.MP4"), ready("b_GH010001.MP4"), auxiliary("b_GH010001.THM")]
+    groups, _ = mr.group_auxiliaries(analyses)
+    assert list(groups) == [Path("b_GH010001.MP4")]
 
 
 def test_group_auxiliaries_duplicate_extension() -> None:

@@ -64,6 +64,12 @@ EXIFTOOL_BATCH_SIZE = 100
 
 LOGS_DIR_NAME = ".logs"
 AUXILIARY_EXTENSIONS = (".lrv", ".thm")
+# GoPro "RAW audio" files (GH<n>.WAV) follow their main video too, but only
+# when their name holds a GoPro file id: other .wav files are regular media.
+GOPRO_AUDIO_EXTENSIONS = (".wav",)
+# GoPro file id at the end of a base name (GOPR0123, GP010123, GH010123,
+# GX010123, GL010123), possibly after a prefix added by another tool.
+GOPRO_FILE_ID_RE = re.compile(r"(?<![a-z0-9])(gopr\d{4}|g[phxl]\d{6})$")
 
 # Capture date tags, by decreasing priority. The first one holding a valid date
 # wins. File system dates (FileModifyDate...) are never used.
@@ -97,7 +103,7 @@ ACTION_RENAME = "rename"
 ACTION_COPY = "copy"
 ACTION_UNCHANGED = "unchanged"
 ACTION_SKIP = "skip"
-# Extensions of the main videos that GoPro auxiliary files (.LRV, .THM) follow.
+# Extensions of the main videos that GoPro auxiliary files (.LRV, .THM, .WAV) follow.
 MAIN_VIDEO_EXTENSIONS = (".mp4", ".mov")
 # GoPro HERO6+ names the low-resolution video GL<n>.LRV next to GH<n>.MP4 / GX<n>.MP4.
 GOPRO_LRV_PREFIX = "gl"
@@ -1287,8 +1293,9 @@ def analyze_file(
     """
     Decide the capture date and device of one file.
 
-    GoPro auxiliary files (``.LRV``, ``.THM``) are only flagged: they take the
-    date and device of their main video later. Files without readable metadata,
+    GoPro auxiliary files (``.LRV``, ``.THM``, and ``.WAV`` named with a GoPro
+    file id) are only flagged: they take the date and device of their main
+    video later. Files without readable metadata,
     without a valid capture date or without any make/model are skipped; the
     system date is never used.
 
@@ -1300,7 +1307,7 @@ def analyze_file(
     :return: Analysis of the file.
     """
     empty_identity = DeviceIdentity("", "", "")
-    if relative.suffix.lower() in AUXILIARY_EXTENSIONS:
+    if is_auxiliary_file(relative):
         return FileAnalysis(relative, STATUS_AUXILIARY, "follows its main video", "", None, empty_identity, None)
     if metadata is None:
         message = "unreadable metadata ({})".format(error or "unknown error")
@@ -1780,6 +1787,36 @@ def folder_key(relative: Path) -> str:
     return relative.parent.as_posix().casefold()
 
 
+def gopro_file_id(stem: str) -> Optional[str]:
+    """
+    Extract the GoPro file id ending a base name.
+
+    The id may follow a prefix added by another tool, separated by a
+    non-alphanumeric character (e.g. ``2025-07-14_19-19-24_GH011892``).
+
+    :param stem: File name without extension.
+    :return: Case-folded id such as ``gh011892``, or ``None`` when absent.
+    """
+    match = GOPRO_FILE_ID_RE.search(stem.casefold())
+    return match.group(1) if match else None
+
+
+def is_auxiliary_file(relative: Path) -> bool:
+    """
+    Tell whether a file is a GoPro auxiliary file following a main video.
+
+    ``.LRV`` and ``.THM`` files always are; ``.WAV`` files only when their name
+    ends with a GoPro file id (GoPro "RAW audio").
+
+    :param relative: File path relative to the source folder.
+    :return: ``True`` for an auxiliary file.
+    """
+    suffix = relative.suffix.lower()
+    if suffix in AUXILIARY_EXTENSIONS:
+        return True
+    return suffix in GOPRO_AUDIO_EXTENSIONS and gopro_file_id(relative.stem) is not None
+
+
 def main_video_stems(auxiliary_stem: str) -> List[str]:
     """
     List the base names a GoPro auxiliary file may share with its main video.
@@ -1801,11 +1838,14 @@ def group_auxiliaries(
     analyses: Sequence[FileAnalysis],
 ) -> Tuple[Dict[Path, List[FileAnalysis]], Dict[Path, str]]:
     """
-    Link GoPro auxiliary files (``.LRV``, ``.THM``) to their main video.
+    Link GoPro auxiliary files (``.LRV``, ``.THM``, ``.WAV``) to their main video.
 
     The main video must be in the same folder, have a ``MAIN_VIDEO_EXTENSIONS``
     extension, share the base name (see ``main_video_stems``) and be ready to
-    rename. A main video takes at most one auxiliary file per extension.
+    rename. When no base name matches, the GoPro file ids ending both names
+    are compared the same way (see ``gopro_file_id``), so files whose names
+    were prefixed differently by another tool are still linked. A main video
+    takes at most one auxiliary file per extension.
 
     :param analyses: File analyses, in plan order.
     :return: Tuple ``(auxiliaries, orphans)``: auxiliary analyses keyed by the
@@ -1813,18 +1853,28 @@ def group_auxiliaries(
         file left alone, keyed by its relative path.
     """
     mains = {}  # type: Dict[Tuple[str, str], FileAnalysis]
+    mains_by_id = {}  # type: Dict[Tuple[str, str], FileAnalysis]
     for analysis in analyses:
         if analysis.status != STATUS_AUXILIARY and analysis.relative.suffix.lower() in MAIN_VIDEO_EXTENSIONS:
-            mains.setdefault((folder_key(analysis.relative), analysis.relative.stem.casefold()), analysis)
+            folder = folder_key(analysis.relative)
+            mains.setdefault((folder, analysis.relative.stem.casefold()), analysis)
+            main_id = gopro_file_id(analysis.relative.stem)
+            if main_id is not None:
+                mains_by_id.setdefault((folder, main_id), analysis)
     auxiliaries = {}  # type: Dict[Path, List[FileAnalysis]]
     orphans = {}  # type: Dict[Path, str]
     for analysis in analyses:
         if analysis.status != STATUS_AUXILIARY:
             continue
         relative = analysis.relative
+        folder = folder_key(relative)
+        lookups = [(mains, stem) for stem in main_video_stems(relative.stem)]
+        auxiliary_id = gopro_file_id(relative.stem)
+        if auxiliary_id is not None:
+            lookups.extend((mains_by_id, file_id) for file_id in main_video_stems(auxiliary_id))
         main = None
-        for stem in main_video_stems(relative.stem):
-            main = mains.get((folder_key(relative), stem))
+        for index, key in lookups:
+            main = index.get((folder, key))
             if main is not None:
                 break
         if main is None:
