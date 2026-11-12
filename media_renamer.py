@@ -83,9 +83,14 @@ DATE_TAGS = ("DateTimeOriginal", "CreateDate", "MediaCreateDate", "TrackCreateDa
 # EXIF 2.31 offset tags giving the UTC offset of a zone-less date tag.
 DATE_OFFSET_TAGS = {"DateTimeOriginal": "OffsetTimeOriginal", "CreateDate": "OffsetTimeDigitized"}
 IDENTITY_TAGS = ("Make", "Model", "SerialNumber")
+# Shown to help the user recognize an unknown device, never used for matching
+# (a firmware update would otherwise look like a new device). First non-empty wins.
+SOFTWARE_TAGS = ("Software", "FirmwareVersion")
 # Only these tags are requested from ExifTool, so GPS and other personal data
 # never enter the program.
-METADATA_TAGS = DATE_TAGS + tuple(DATE_OFFSET_TAGS.values()) + IDENTITY_TAGS + ("Error",)
+METADATA_TAGS = DATE_TAGS + tuple(DATE_OFFSET_TAGS.values()) + IDENTITY_TAGS + SOFTWARE_TAGS + ("Error",)
+# Number of example file names shown for an unknown device.
+UNKNOWN_DEVICE_EXAMPLES = 3
 EXIF_DATE_RE = re.compile(
     r"^(\d{4})[:-](\d{2})[:-](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?"
     r"\s*(Z|[+-]\d{2}:?\d{2})?$"
@@ -167,6 +172,7 @@ class FileAnalysis(NamedTuple):
     identity: DeviceIdentity
     device: Optional[Dict[str, Any]]
     effective: Optional[EffectiveDate] = None
+    software: str = ""
 
 
 class PlanEntry(NamedTuple):
@@ -1260,6 +1266,20 @@ def extract_identity(metadata: Mapping[str, Any]) -> DeviceIdentity:
     )
 
 
+def extract_software(metadata: Mapping[str, Any]) -> str:
+    """
+    Read the software or firmware that wrote a file, to help recognize its device.
+
+    :param metadata: Tags returned by ExifTool for the file.
+    :return: First non-empty value of ``SOFTWARE_TAGS``; empty when none.
+    """
+    for tag in SOFTWARE_TAGS:
+        value = clean_text(metadata.get(tag))
+        if value:
+            return value
+    return ""
+
+
 def device_matches(device: Mapping[str, Any], identity: DeviceIdentity) -> bool:
     """
     Tell whether a device entry matches a file's identification.
@@ -1346,7 +1366,8 @@ def analyze_file(
     if not identity.make and not identity.model:
         message = "no Make/Model metadata to identify the device (use --device)"
         return FileAnalysis(relative, STATUS_SKIPPED, message, date_tag, date, identity, None)
-    return FileAnalysis(relative, STATUS_UNKNOWN_DEVICE, "", date_tag, date, identity, None)
+    return FileAnalysis(relative, STATUS_UNKNOWN_DEVICE, "", date_tag, date, identity, None,
+                        software=extract_software(metadata))
 
 
 def collect_unknown_identities(analyses: Iterable[FileAnalysis]) -> List[DeviceIdentity]:
@@ -1390,6 +1411,79 @@ def describe_identity(identity: DeviceIdentity) -> str:
     if identity.serial_number:
         parts.append("serial {}".format(mask_serial(identity.serial_number)))
     return ", ".join(parts) or "no identification"
+
+
+def describe_unknown_files(identity: DeviceIdentity, analyses: Iterable[FileAnalysis]) -> List[str]:
+    """
+    Describe the files of an unknown device, to help the user recognize it.
+
+    :param identity: Identification of the unknown device.
+    :param analyses: File analyses of the batch.
+    :return: Lines giving the number of files, their capture date range, a few
+        example names and, when present, the software or firmware that wrote them.
+    """
+    files = [analysis for analysis in analyses
+             if analysis.status == STATUS_UNKNOWN_DEVICE and analysis.identity == identity]
+    if not files:
+        return []
+    dates = sorted(analysis.date.date() for analysis in files if analysis.date is not None)
+    names = [analysis.relative.as_posix() for analysis in files[:UNKNOWN_DEVICE_EXAMPLES]]
+    if len(files) > UNKNOWN_DEVICE_EXAMPLES:
+        names.append("...")
+    line = "{} file(s)".format(len(files))
+    if dates:
+        span = dates[0].isoformat() if dates[0] == dates[-1] else "{} to {}".format(dates[0], dates[-1])
+        line += ", taken {}".format(span)
+    lines = ["{}, e.g. {}".format(line, ", ".join(names))]
+    software = []  # type: List[str]
+    for analysis in files:
+        if analysis.software and analysis.software not in software:
+            software.append(analysis.software)
+    if software:
+        lines.append("Software: {}".format(", ".join(software)))
+    return lines
+
+
+def describe_device(device: Mapping[str, Any], show_serial: bool = True) -> str:
+    """
+    Describe a device entry for the user: its id, completed by readable details.
+
+    The id stays the reference used in ``conf/devices.json`` and by ``--device``;
+    the label and the ``match`` criteria (make, model) tell which camera it is.
+
+    :param device: Device entry.
+    :param show_serial: Whether to show the masked serial number; disable it for text that reaches the log.
+    :return: Text such as ``'hero9-black' (label 'HERO9 Black'; Make 'GoPro', Model 'HERO9 Black')``.
+    """
+    match = device.get("match") or {}
+    identity = DeviceIdentity(
+        clean_text(match.get("make")),
+        clean_text(match.get("model")),
+        clean_text(match.get("serial_number")) if show_serial else "",
+    )
+    details = ["label '{}'".format(clean_text(device.get("label")))]
+    if any(identity):
+        details.append(describe_identity(identity))
+    return "'{}' ({})".format(clean_text(device.get("id")), "; ".join(details))
+
+
+def format_unknown_forced_device_error(device_id: str, devices: Sequence[Mapping[str, Any]]) -> str:
+    """
+    Build the error shown when ``--device`` names an unknown id.
+
+    Serial numbers are left out because the message is also logged.
+
+    :param device_id: Id given to ``--device``.
+    :param devices: Known device entries.
+    :return: Multi-line message listing the known ids with their label, make and model.
+    """
+    lines = ["--device: unknown device id {!r}".format(device_id)]
+    if devices:
+        lines.append("Known devices:")
+        lines.extend("  - {}".format(describe_device(device, show_serial=False)) for device in devices)
+    else:
+        lines.append("No device is registered in conf/devices.json.")
+    return "\n".join(lines)
 
 
 def make_device_id(label: str, devices: Iterable[Mapping[str, Any]]) -> str:
@@ -1504,6 +1598,7 @@ def prompt_new_device(
     devices: Sequence[Mapping[str, Any]],
     input_func: Callable[[str], str],
     out: TextIO,
+    context: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """
     Ask the user to describe an unknown device.
@@ -1515,10 +1610,13 @@ def prompt_new_device(
     :param devices: Existing device entries, used to build a unique id.
     :param input_func: Function reading one line, such as ``input``.
     :param out: Stream for messages.
+    :param context: Lines describing the device's files, shown before the questions.
     :return: New, valid device entry.
     :raises EOFError: If the input stream is closed.
     """
     print("\nUnknown device: {}".format(describe_identity(identity)), file=out)
+    for line in context:
+        print("  {}".format(line), file=out)
     suggestion = default_label(identity)
     label = ask(input_func, out, "  Label used in file names [{}]: ".format(suggestion),
                 validate_label_answer, suggestion)
@@ -1590,12 +1688,13 @@ def resolve_unknown_devices(
         raise UnknownDeviceError(format_unknown_devices_error(unknown))
     while unknown:
         try:
-            device = prompt_new_device(unknown[0], known, input_func, out)
+            device = prompt_new_device(unknown[0], known, input_func, out,
+                                       describe_unknown_files(unknown[0], current))
         except EOFError:
             raise UnknownDeviceError(format_unknown_devices_error(unknown))
         known.append(device)
         write_devices_file(devices_path, {"devices": known})
-        print("  Saved device '{}' to {}".format(device["id"], devices_path), file=out)
+        print("  Saved device {} to {}".format(describe_device(device), devices_path), file=out)
         current = [
             analysis._replace(status=STATUS_READY, device=device)
             if analysis.status == STATUS_UNKNOWN_DEVICE and device_matches(device, analysis.identity)
@@ -2595,7 +2694,7 @@ def run_batch(
     if args.device is not None:
         forced_device = find_device(devices, args.device)
         if forced_device is None:
-            report_error(logger, "--device: unknown device id {!r}".format(args.device))
+            report_error(logger, format_unknown_forced_device_error(args.device, devices))
             return 1
     source = Path(args.source)
     if not source.is_dir():

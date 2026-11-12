@@ -300,7 +300,7 @@ Each file is matched against `conf/devices.json`, in file order; the first match
 
 ### Unknown devices
 
-When files come from a device missing in `conf/devices.json`, the tool asks, once per device and before touching any file, for a label, a clock offset (signed `HH:MM:SS`), an optional IANA time zone and, when the file has one, whether to match this camera body by its serial number. The answer is saved to `conf/devices.json` (with a `devices.json.bak` copy) and reused for every matching file.
+When files come from a device missing in `conf/devices.json`, the tool shows its make and model, how many files it took, their capture date range, a few file names and, when present, the software or firmware that wrote them. It then asks, once per device and before touching any file, for a label, a clock offset (signed `HH:MM:SS`), an optional IANA time zone and, when the file has one, whether to match this camera body by its serial number. The answer is saved to `conf/devices.json` (with a `devices.json.bak` copy) and reused for every matching file.
 
 Without an interactive terminal, the run stops with the list of unknown devices: add them to `conf/devices.json`, run in a terminal, or use `--device`. Files with neither make nor model are skipped unless `--device` is given.
 

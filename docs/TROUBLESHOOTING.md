@@ -38,10 +38,10 @@ exiftool -ver
 
 ## Inspect a file's tags
 
-MediaRenamer reads only these tags: `DateTimeOriginal`, `CreateDate`, `MediaCreateDate`, `TrackCreateDate` (dates, in this priority), `OffsetTimeOriginal`, `OffsetTimeDigitized` (UTC offsets), and `Make`, `Model`, `SerialNumber` (device identification). To see what ExifTool returns for one file:
+MediaRenamer reads only these tags: `DateTimeOriginal`, `CreateDate`, `MediaCreateDate`, `TrackCreateDate` (dates, in this priority), `OffsetTimeOriginal`, `OffsetTimeDigitized` (UTC offsets), `Make`, `Model`, `SerialNumber` (device identification), and `Software`, `FirmwareVersion` (only shown to help recognize an unknown device, never used for matching). To see what ExifTool returns for one file:
 
 ```sh
-exiftool -s -DateTimeOriginal -CreateDate -MediaCreateDate -TrackCreateDate -OffsetTimeOriginal -OffsetTimeDigitized -Make -Model -SerialNumber FILE
+exiftool -s -DateTimeOriginal -CreateDate -MediaCreateDate -TrackCreateDate -OffsetTimeOriginal -OffsetTimeDigitized -Make -Model -SerialNumber -Software -FirmwareVersion FILE
 ```
 
 To list every date of the file with the group it comes from:

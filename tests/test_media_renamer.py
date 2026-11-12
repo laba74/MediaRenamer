@@ -1447,6 +1447,26 @@ def test_extract_identity() -> None:
     assert mr.extract_identity({}) == mr.DeviceIdentity("", "", "")
 
 
+def test_extract_software() -> None:
+    """
+    Check that the first non-empty software or firmware tag is read.
+    """
+    assert mr.extract_software({"Software": " E4500v1.1 ", "FirmwareVersion": "X"}) == "E4500v1.1"
+    assert mr.extract_software({"Software": "", "FirmwareVersion": "HD9.01.01.72.00"}) == "HD9.01.01.72.00"
+    assert mr.extract_software({}) == ""
+
+
+def test_analyze_file_keeps_software_of_unknown_device() -> None:
+    """
+    Check that the software tag is kept for a file whose device is unknown.
+    """
+    metadata = {"DateTimeOriginal": "2024:01:02 03:04:05", "Make": "NIKON", "Model": "E4500",
+                "Software": "E4500v1.1"}
+    analysis = mr.analyze_file(Path("a.jpg"), metadata, None, [])
+    assert analysis.status == mr.STATUS_UNKNOWN_DEVICE
+    assert analysis.software == "E4500v1.1"
+
+
 @pytest.mark.parametrize(
     "match, identity, expected",
     [
@@ -1544,6 +1564,56 @@ def test_mask_serial_and_describe_identity() -> None:
     assert mr.describe_identity(mr.DeviceIdentity("", "", "")) == "no identification"
 
 
+def test_describe_unknown_files() -> None:
+    """
+    Check the file count, date range, examples and software shown for an unknown device.
+    """
+    identity = mr.DeviceIdentity("SONY", "DSC-TF1", "")
+    analyses = [make_unknown(name, "SONY", "DSC-TF1") for name in ("a.jpg", "b.jpg", "c.jpg", "d.jpg")]
+    analyses[1] = analyses[1]._replace(date=datetime(2023, 5, 6), software="v1")
+    analyses[2] = analyses[2]._replace(software="v1")
+    analyses[3] = analyses[3]._replace(software="v2")
+    analyses.append(make_unknown("n.jpg", "NIKON", "E4500"))
+    assert mr.describe_unknown_files(identity, analyses) == [
+        "4 file(s), taken 2023-05-06 to 2024-01-02, e.g. a.jpg, b.jpg, c.jpg, ...",
+        "Software: v1, v2",
+    ]
+    single = mr.describe_unknown_files(mr.DeviceIdentity("NIKON", "E4500", ""), analyses)
+    assert single == ["1 file(s), taken 2024-01-02, e.g. n.jpg"]
+    undated = [make_unknown("u.jpg", "X", "Y")._replace(date=None)]
+    assert mr.describe_unknown_files(mr.DeviceIdentity("X", "Y", ""), undated) == ["1 file(s), e.g. u.jpg"]
+    assert mr.describe_unknown_files(mr.DeviceIdentity("Z", "Z", ""), analyses) == []
+
+
+def test_describe_device() -> None:
+    """
+    Check that a device is described by its id, completed by its label, make, model and masked serial.
+    """
+    device = make_device(id="gopro-1", label="Ma GoPro",
+                         match={"make": "GoPro", "model": "HERO9 Black", "serial_number": "C3441326974391"})
+    assert mr.describe_device(device) == (
+        "'gopro-1' (label 'Ma GoPro'; Make 'GoPro', Model 'HERO9 Black', serial ***4391)")
+    assert mr.describe_device(device, show_serial=False) == (
+        "'gopro-1' (label 'Ma GoPro'; Make 'GoPro', Model 'HERO9 Black')")
+    assert mr.describe_device({"id": "x", "label": "X", "match": {}}) == "'x' (label 'X')"
+
+
+def test_format_unknown_forced_device_error() -> None:
+    """
+    Check that the ``--device`` error lists the known devices without serial numbers.
+    """
+    devices = [make_device(id="a7", label="Sony", match={"make": "SONY", "model": "ILCE-7M3",
+                                                         "serial_number": "123456789"})]
+    text = mr.format_unknown_forced_device_error("nope", devices)
+    assert text.splitlines() == [
+        "--device: unknown device id 'nope'",
+        "Known devices:",
+        "  - 'a7' (label 'Sony'; Make 'SONY', Model 'ILCE-7M3')",
+    ]
+    assert "6789" not in text
+    assert "No device is registered" in mr.format_unknown_forced_device_error("nope", [])
+
+
 def test_make_device_id() -> None:
     """
     Check that ids are slugs, unique among existing devices.
@@ -1637,6 +1707,16 @@ def test_prompt_new_device_defaults() -> None:
                       "match": {"model": "HERO9 Black"}}
 
 
+def test_prompt_new_device_shows_context() -> None:
+    """
+    Check that the context lines are shown under the device before the questions.
+    """
+    out = io.StringIO()
+    mr.prompt_new_device(mr.DeviceIdentity("SONY", "DSC-TF1", ""), [], scripted(["", "", ""]), out,
+                         ["1 file(s), e.g. a.jpg", "Software: v1"])
+    assert out.getvalue() == "\nUnknown device: Make 'SONY', Model 'DSC-TF1'\n  1 file(s), e.g. a.jpg\n  Software: v1\n"
+
+
 def test_format_unknown_devices_error() -> None:
     """
     Check that the message lists devices (masked serial) and the possible fixes.
@@ -1712,6 +1792,9 @@ def test_resolve_unknown_devices_asks_once_per_device(tmp_path: Path) -> None:
     assert [device["id"] for device in mr.load_devices(path)] == ["other", "hero9-black", "e4500"]
     assert (tmp_path / "devices.json.bak").is_file()
     assert devices == mr.load_devices(path)
+    assert "Saved device 'hero9-black' (label 'HERO9 Black'; Model 'HERO9 Black') to" in out.getvalue()
+    assert "  1 file(s), taken 2024-01-02, e.g. v.mp4\n" in out.getvalue()
+    assert "  1 file(s), taken 2024-01-02, e.g. n.jpg\n" in out.getvalue()
 
 
 # --- analyze_source / print_analysis ------------------------------------------
