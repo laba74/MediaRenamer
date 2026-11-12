@@ -1,0 +1,15 @@
+[project]
+name = "media-renamer"
+version = "0.1.0"
+description = "Configurable CLI that renames photos and videos from their metadata."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

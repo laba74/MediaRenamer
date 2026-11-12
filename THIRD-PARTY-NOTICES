@@ -1,0 +1,9 @@
+Third-party notices
+===================
+
+MediaRenamer's own code is released under the MIT license (see LICENSE).
+
+ExifTool (https://exiftool.org) is an external program, installed manually in
+`bin/` (e.g. `bin/exiftool-13.62_64/`) and NOT redistributed in this repository. It remains under its own
+license (Perl Artistic License / GPL). If a binary is ever redistributed with
+MediaRenamer, add its notices and license text here or in `LICENSES/`.
