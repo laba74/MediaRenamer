@@ -23,12 +23,12 @@ Goal: load and validate `conf/config.json` / `conf/devices.json`, locate ExifToo
 - **1.6 `--check`** — Validate configuration and print ExifTool version and location; non-zero exit on failure.
 
 ### Done — Epic 1
-- [ ] `uv run python media_renamer.py --help` lists every option of the plan.
-- [ ] `conf/config.json` and `conf/devices.json` are git-ignored; the `*.default.json` templates are tracked.
-- [ ] On first run with missing personal files, they are created from the templates; existing files are left untouched (tested).
-- [ ] `--check` succeeds with the default `conf/config.json`, empty `conf/devices.json` and ExifTool installed.
-- [ ] `--check` fails with an explicit message for: invalid JSON, unknown token, bad offset, duplicate device id, missing ExifTool.
-- [ ] Unit tests cover each validation rule (valid and invalid cases).
+- [x] `uv run python media_renamer.py --help` lists every option of the plan.
+- [x] `conf/config.json` and `conf/devices.json` are git-ignored; the `*.default.json` templates are tracked.
+- [x] On first run with missing personal files, they are created from the templates; existing files are left untouched (tested).
+- [x] `--check` succeeds with the default `conf/config.json`, empty `conf/devices.json` and ExifTool installed.
+- [x] `--check` fails with an explicit message for: invalid JSON, unknown token, bad offset, duplicate device id, missing ExifTool.
+- [x] Unit tests cover each validation rule (valid and invalid cases).
 
 ---
 
