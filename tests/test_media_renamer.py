@@ -118,6 +118,8 @@ def test_build_arg_parser_defaults() -> None:
 def test_build_arg_parser_help_lists_every_option(capsys: pytest.CaptureFixture) -> None:
     """
     Check that ``--help`` lists every option of the plan.
+
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     with pytest.raises(SystemExit) as exc:
         mr.build_arg_parser().parse_args(["--help"])
@@ -133,6 +135,8 @@ def test_build_arg_parser_help_lists_every_option(capsys: pytest.CaptureFixture)
 def test_ensure_personal_files_creates_missing_files(project: Path) -> None:
     """
     Check that missing personal files are copied from their templates.
+
+    :param project: Project root with the configuration templates.
     """
     conf = project / "conf"
     created = mr.ensure_personal_files(conf)
@@ -144,6 +148,8 @@ def test_ensure_personal_files_creates_missing_files(project: Path) -> None:
 def test_ensure_personal_files_never_overwrites(project: Path) -> None:
     """
     Check that existing personal files are left untouched.
+
+    :param project: Project root with the configuration templates.
     """
     conf = project / "conf"
     (conf / "config.json").write_text("personal config", encoding="utf-8")
@@ -156,6 +162,8 @@ def test_ensure_personal_files_never_overwrites(project: Path) -> None:
 def test_ensure_personal_files_creates_only_the_missing_one(project: Path) -> None:
     """
     Check that only the missing personal file is created.
+
+    :param project: Project root with the configuration templates.
     """
     conf = project / "conf"
     (conf / "config.json").write_text("personal config", encoding="utf-8")
@@ -166,6 +174,8 @@ def test_ensure_personal_files_creates_only_the_missing_one(project: Path) -> No
 def test_ensure_personal_files_missing_template(tmp_path: Path) -> None:
     """
     Check that a missing template raises ``ConfigError``.
+
+    :param tmp_path: Pytest temporary folder.
     """
     with pytest.raises(mr.ConfigError, match="template"):
         mr.ensure_personal_files(tmp_path)
@@ -177,6 +187,8 @@ def test_ensure_personal_files_missing_template(tmp_path: Path) -> None:
 def test_load_json_file_valid(tmp_path: Path) -> None:
     """
     Check that a valid JSON file is parsed, even with a UTF-8 BOM.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = tmp_path / "a.json"
     path.write_bytes(b'\xef\xbb\xbf{"a": 1}')
@@ -186,6 +198,8 @@ def test_load_json_file_valid(tmp_path: Path) -> None:
 def test_load_json_file_invalid_json(tmp_path: Path) -> None:
     """
     Check that invalid JSON is reported with its position.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = tmp_path / "a.json"
     path.write_text('{"a": 1,}', encoding="utf-8")
@@ -196,6 +210,8 @@ def test_load_json_file_invalid_json(tmp_path: Path) -> None:
 def test_load_json_file_missing(tmp_path: Path) -> None:
     """
     Check that a missing file raises ``ConfigError``.
+
+    :param tmp_path: Pytest temporary folder.
     """
     with pytest.raises(mr.ConfigError, match="file not found"):
         mr.load_json_file(tmp_path / "missing.json")
@@ -204,6 +220,8 @@ def test_load_json_file_missing(tmp_path: Path) -> None:
 def test_load_json_file_unreadable(tmp_path: Path) -> None:
     """
     Check that a non UTF-8 file raises ``ConfigError``.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = tmp_path / "a.json"
     path.write_bytes(b"\xff\xfe\xfa")
@@ -221,6 +239,25 @@ def test_find_invalid_filename_chars() -> None:
     assert mr.find_invalid_filename_chars("ok_name-1") == []
     assert mr.find_invalid_filename_chars('a<b>c:d"e/f\\g|h?i*j<') == list('<>:"/\\|?*')
     assert mr.find_invalid_filename_chars("tab\there") == ["\t"]
+    assert mr.find_invalid_filename_chars("del\x7fete") == ["\x7f"]
+    assert mr.find_invalid_filename_chars("été 📷 (1)") == []
+
+
+def test_validate_label() -> None:
+    """
+    Check that a label must be portable: no forbidden character, no leading or trailing space or dot.
+    """
+    assert mr.validate_label("GoPro 9") == []
+    assert mr.validate_label("Été (Sony)") == []
+    assert mr.validate_label("v1.2") == []
+    assert mr.validate_label("") == ["'label' must be a non-empty string"]
+    assert mr.validate_label("   ") == ["'label' must be a non-empty string"]
+    assert mr.validate_label(3) == ["'label' must be a non-empty string"]
+    assert mr.validate_label("a:b") == ["'label' contains invalid file name characters: ':'"]
+    assert mr.validate_label("a\x7fb") == ["'label' contains invalid file name characters: '\\x7f'"]
+    assert mr.validate_label("GoPro ") == ["'label' must not start or end with a space"]
+    assert mr.validate_label(".GoPro") == ["'label' must not start or end with '.'"]
+    assert len(mr.validate_label(" a?.")) == 3
 
 
 # --- validate_filename_pattern ------------------------------------------------
@@ -256,6 +293,9 @@ def test_validate_filename_pattern_valid() -> None:
 def test_validate_filename_pattern_invalid(pattern: Any, expected: str) -> None:
     """
     Check that invalid patterns are rejected with an explicit message.
+
+    :param pattern: Invalid ``filename_pattern``.
+    :param expected: Part of the expected error message.
     """
     errors = mr.validate_filename_pattern(pattern)
     assert any(expected in error for error in errors), errors
@@ -285,6 +325,9 @@ def test_validate_extensions_valid() -> None:
 def test_validate_extensions_invalid(extensions: Any, expected: str) -> None:
     """
     Check that invalid extension lists are rejected.
+
+    :param extensions: Invalid ``supported_extensions`` value.
+    :param expected: Part of the expected error message.
     """
     assert any(expected in error for error in mr.validate_extensions(extensions))
 
@@ -295,6 +338,8 @@ def test_validate_extensions_invalid(extensions: Any, expected: str) -> None:
 def test_validate_config_default_is_valid(config_data: Dict[str, Any]) -> None:
     """
     Check that the default configuration template is valid.
+
+    :param config_data: Content of the default configuration template.
     """
     assert mr.validate_config(config_data) == []
 
@@ -312,6 +357,10 @@ def test_validate_config_default_is_valid(config_data: Dict[str, Any]) -> None:
 def test_validate_config_invalid_values(config_data: Dict[str, Any], change: Dict[str, Any], expected: str) -> None:
     """
     Check that invalid settings are reported.
+
+    :param config_data: Content of the default configuration template.
+    :param change: Settings overriding the default configuration.
+    :param expected: Part of the expected error message.
     """
     config_data.update(change)
     assert any(expected in error for error in mr.validate_config(config_data))
@@ -320,6 +369,8 @@ def test_validate_config_invalid_values(config_data: Dict[str, Any], change: Dic
 def test_validate_config_missing_setting(config_data: Dict[str, Any]) -> None:
     """
     Check that a missing setting is reported.
+
+    :param config_data: Content of the default configuration template.
     """
     del config_data["log_level"]
     assert "missing setting 'log_level'" in mr.validate_config(config_data)
@@ -335,6 +386,9 @@ def test_validate_config_not_an_object() -> None:
 def test_load_config_normalizes_extensions(tmp_path: Path, config_data: Dict[str, Any]) -> None:
     """
     Check that a valid configuration loads with lower-case extensions.
+
+    :param tmp_path: Pytest temporary folder.
+    :param config_data: Content of the default configuration template.
     """
     config_data["supported_extensions"] = [".JPG", ".Mp4"]
     config = mr.load_config(write_json(tmp_path / "config.json", config_data))
@@ -344,6 +398,9 @@ def test_load_config_normalizes_extensions(tmp_path: Path, config_data: Dict[str
 def test_load_config_invalid(tmp_path: Path, config_data: Dict[str, Any]) -> None:
     """
     Check that an invalid configuration raises ``ConfigError`` listing the errors.
+
+    :param tmp_path: Pytest temporary folder.
+    :param config_data: Content of the default configuration template.
     """
     config_data["filename_pattern"] = "{NOPE}"
     with pytest.raises(mr.ConfigError, match="unknown token"):
@@ -367,6 +424,9 @@ def test_load_config_invalid(tmp_path: Path, config_data: Dict[str, Any]) -> Non
 def test_parse_offset_valid(text: str, seconds: int) -> None:
     """
     Check that signed ``HH:MM:SS`` offsets are converted to seconds.
+
+    :param text: Offset to parse.
+    :param seconds: Expected offset, in seconds.
     """
     assert mr.parse_offset(text) == seconds
 
@@ -375,6 +435,8 @@ def test_parse_offset_valid(text: str, seconds: int) -> None:
 def test_parse_offset_invalid(text: Any) -> None:
     """
     Check that malformed offsets raise ``ValueError``.
+
+    :param text: Invalid offset value.
     """
     with pytest.raises(ValueError, match="invalid offset"):
         mr.parse_offset(text)
@@ -392,17 +454,40 @@ def test_get_available_timezones_returns_set() -> None:
     assert all(isinstance(zone, str) for zone in zones)
 
 
-def test_get_available_timezones_without_zoneinfo(monkeypatch: pytest.MonkeyPatch) -> None:
+def simulate_missing_timezone_database(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Check that no zone is returned when ``zoneinfo`` is unavailable.
+    Make the time zone database look absent, as on Windows without the optional ``tzdata`` package.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr(mr, "zoneinfo", None)
+    def missing_zone(key: str) -> Any:
+        """
+        Fail like ``zoneinfo.ZoneInfo`` does without a time zone database.
+
+        :param key: Zone name.
+        :raises zoneinfo.ZoneInfoNotFoundError: Always.
+        """
+        raise mr.zoneinfo.ZoneInfoNotFoundError("No time zone found with key {}".format(key))
+
+    monkeypatch.setattr(mr.zoneinfo, "available_timezones", lambda: set())
+    monkeypatch.setattr(mr.zoneinfo, "ZoneInfo", missing_zone)
+
+
+def test_get_available_timezones_without_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that no zone is returned when no time zone database is available.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    simulate_missing_timezone_database(monkeypatch)
     assert mr.get_available_timezones() == set()
 
 
 def test_has_timezone_database(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that the database is reported available only when zones are known.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setattr(mr, "get_available_timezones", lambda: {"Europe/Paris"})
     assert mr.has_timezone_database() is True
@@ -410,13 +495,11 @@ def test_has_timezone_database(monkeypatch: pytest.MonkeyPatch) -> None:
     assert mr.has_timezone_database() is False
 
 
-def test_describe_missing_timezone_database(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_describe_missing_timezone_database() -> None:
     """
-    Check the explanation given for a missing database, with and without ``zoneinfo``.
+    Check that the explanation of a missing database points to the optional ``tzdata`` package.
     """
-    assert "tzdata" in mr.describe_missing_timezone_database()
-    monkeypatch.setattr(mr, "zoneinfo", None)
-    assert "Python 3.9" in mr.describe_missing_timezone_database()
+    assert "optional 'tzdata' package" in mr.describe_missing_timezone_database()
 
 
 def test_validate_timezone_syntax_only() -> None:
@@ -463,6 +546,9 @@ def test_validate_match_valid() -> None:
 def test_validate_match_invalid(match: Any, expected: str) -> None:
     """
     Check that invalid match criteria are rejected.
+
+    :param match: Invalid ``match`` criteria.
+    :param expected: Part of the expected error message.
     """
     assert any(expected in error for error in mr.validate_match(match))
 
@@ -485,6 +571,8 @@ def test_validate_device_valid() -> None:
         ({"id": ""}, "'id' must be a non-empty string"),
         ({"label": ""}, "'label' must be a non-empty string"),
         ({"label": "Go/Pro"}, "invalid file name characters"),
+        ({"label": " GoPro"}, "must not start or end with a space"),
+        ({"label": "GoPro."}, "must not start or end with '.'"),
         ({"match": {}}, "non-empty 'make' or 'model'"),
         ({"timezone": "Not a zone"}, "invalid time zone"),
         ({"color": "red"}, "unknown field 'color'"),
@@ -493,6 +581,9 @@ def test_validate_device_valid() -> None:
 def test_validate_device_invalid(overrides: Dict[str, Any], expected: str) -> None:
     """
     Check that invalid device fields are reported.
+
+    :param overrides: Fields overriding a valid device entry.
+    :param expected: Part of the expected error message.
     """
     errors = mr.validate_device(make_device(**overrides), set())
     assert any(expected in error for error in errors), errors
@@ -539,6 +630,8 @@ def test_validate_devices_prefixes_entry_errors() -> None:
 def test_validate_devices_bad_structure(data: Any) -> None:
     """
     Check that a document without a ``devices`` list is rejected.
+
+    :param data: Devices document with a wrong structure.
     """
     assert mr.validate_devices(data) == ["the devices file must be a JSON object with a 'devices' list"]
 
@@ -553,6 +646,8 @@ def test_validate_devices_unknown_top_level_key() -> None:
 def test_load_devices_valid(tmp_path: Path) -> None:
     """
     Check that a valid devices file loads its entries.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = write_json(tmp_path / "devices.json", {"devices": [make_device()]})
     assert mr.load_devices(path) == [make_device()]
@@ -561,6 +656,8 @@ def test_load_devices_valid(tmp_path: Path) -> None:
 def test_load_devices_invalid(tmp_path: Path) -> None:
     """
     Check that an invalid devices file raises ``ConfigError``.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = write_json(tmp_path / "devices.json", {"devices": [make_device(), make_device()]})
     with pytest.raises(mr.ConfigError, match="duplicate id"):
@@ -585,6 +682,8 @@ def test_find_device() -> None:
 def test_write_devices_file_creates_file_without_backup(tmp_path: Path) -> None:
     """
     Check that a new file is written and no backup is made when none existed.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = tmp_path / "devices.json"
     data = {"devices": [make_device()]}
@@ -596,6 +695,8 @@ def test_write_devices_file_creates_file_without_backup(tmp_path: Path) -> None:
 def test_write_devices_file_backs_up_previous_content(tmp_path: Path) -> None:
     """
     Check that the previous content is saved to ``devices.json.bak``.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = write_json(tmp_path / "devices.json", {"devices": []})
     previous = path.read_text(encoding="utf-8")
@@ -608,6 +709,8 @@ def test_write_devices_file_backs_up_previous_content(tmp_path: Path) -> None:
 def test_write_devices_file_rejects_invalid_data(tmp_path: Path) -> None:
     """
     Check that invalid data is refused and the file is left untouched.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = write_json(tmp_path / "devices.json", {"devices": []})
     with pytest.raises(mr.ConfigError, match="refusing"):
@@ -618,6 +721,9 @@ def test_write_devices_file_rejects_invalid_data(tmp_path: Path) -> None:
 def test_write_devices_file_cleans_up_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that a failed replace keeps the original file and removes the temporary file.
+
+    :param tmp_path: Pytest temporary folder.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     path = write_json(tmp_path / "devices.json", {"devices": []})
 
@@ -644,6 +750,8 @@ def test_write_devices_file_cleans_up_on_failure(tmp_path: Path, monkeypatch: py
 def test_exiftool_executable_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check the executable name on Windows and POSIX.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setattr(mr.os, "name", "nt")
     assert mr.exiftool_executable_name() == "exiftool.exe"
@@ -654,6 +762,8 @@ def test_exiftool_executable_name(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_is_executable_file(tmp_path: Path) -> None:
     """
     Check that executable files are detected and folders or missing paths are not.
+
+    :param tmp_path: Pytest temporary folder.
     """
     assert mr.is_executable_file(make_fake_exe(tmp_path / EXE_NAME))
     assert not mr.is_executable_file(tmp_path)
@@ -664,6 +774,8 @@ def test_is_executable_file(tmp_path: Path) -> None:
 def test_is_executable_file_requires_permission(tmp_path: Path) -> None:
     """
     Check that a non-executable file is rejected on POSIX.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = tmp_path / "exiftool"
     path.write_text("", encoding="utf-8")
@@ -685,6 +797,8 @@ def test_natural_sort_key() -> None:
 def test_find_exiftool_in_bin_direct_wins(tmp_path: Path) -> None:
     """
     Check that ``bin/<exe>`` is preferred over versioned subfolders.
+
+    :param tmp_path: Pytest temporary folder.
     """
     direct = make_fake_exe(tmp_path / EXE_NAME)
     make_fake_exe(tmp_path / "exiftool-13.62_64" / EXE_NAME)
@@ -694,6 +808,8 @@ def test_find_exiftool_in_bin_direct_wins(tmp_path: Path) -> None:
 def test_find_exiftool_in_bin_highest_version_subfolder(tmp_path: Path) -> None:
     """
     Check that the highest versioned subfolder wins.
+
+    :param tmp_path: Pytest temporary folder.
     """
     make_fake_exe(tmp_path / "exiftool-9.0" / EXE_NAME)
     newest = make_fake_exe(tmp_path / "exiftool-13.62_64" / EXE_NAME)
@@ -703,6 +819,8 @@ def test_find_exiftool_in_bin_highest_version_subfolder(tmp_path: Path) -> None:
 def test_find_exiftool_in_bin_not_found(tmp_path: Path) -> None:
     """
     Check that ``None`` is returned for a missing or empty ``bin/``.
+
+    :param tmp_path: Pytest temporary folder.
     """
     assert mr.find_exiftool_in_bin(tmp_path / "missing", EXE_NAME) is None
     (tmp_path / "empty").mkdir()
@@ -712,6 +830,8 @@ def test_find_exiftool_in_bin_not_found(tmp_path: Path) -> None:
 def test_find_keep_open_variants(tmp_path: Path) -> None:
     """
     Check that ``exiftool(-k)`` executables are listed.
+
+    :param tmp_path: Pytest temporary folder.
     """
     variant = make_fake_exe(tmp_path / "exiftool-13.62_64" / "exiftool(-k).exe")
     assert mr.find_keep_open_variants(tmp_path) == [variant]
@@ -724,6 +844,8 @@ def test_find_keep_open_variants(tmp_path: Path) -> None:
 def test_find_exiftool_prefers_bin(tmp_path: Path) -> None:
     """
     Check that ``bin/`` wins over ``PATH`` and ``EXIFTOOL_PATH``.
+
+    :param tmp_path: Pytest temporary folder.
     """
     in_bin = make_fake_exe(tmp_path / "bin" / EXE_NAME)
     on_path = make_fake_exe(tmp_path / "path" / EXE_NAME)
@@ -734,6 +856,8 @@ def test_find_exiftool_prefers_bin(tmp_path: Path) -> None:
 def test_find_exiftool_uses_path(tmp_path: Path) -> None:
     """
     Check that ``PATH`` is used when ``bin/`` has no ExifTool.
+
+    :param tmp_path: Pytest temporary folder.
     """
     on_path = make_fake_exe(tmp_path / "path" / EXE_NAME)
     found = mr.find_exiftool(tmp_path / "bin", {"PATH": str(on_path.parent)})
@@ -743,6 +867,8 @@ def test_find_exiftool_uses_path(tmp_path: Path) -> None:
 def test_find_exiftool_uses_env_var_file_or_folder(tmp_path: Path) -> None:
     """
     Check that ``EXIFTOOL_PATH`` may point to the executable or its folder.
+
+    :param tmp_path: Pytest temporary folder.
     """
     exe = make_fake_exe(tmp_path / "tools" / EXE_NAME)
     assert mr.find_exiftool(tmp_path / "bin", {"PATH": "", "EXIFTOOL_PATH": str(exe)}) == exe
@@ -752,6 +878,8 @@ def test_find_exiftool_uses_env_var_file_or_folder(tmp_path: Path) -> None:
 def test_find_exiftool_missing(tmp_path: Path) -> None:
     """
     Check the explicit error when ExifTool is nowhere.
+
+    :param tmp_path: Pytest temporary folder.
     """
     env = {"PATH": "", "EXIFTOOL_PATH": str(tmp_path / "nowhere")}
     with pytest.raises(mr.ExifToolError, match="ExifTool not found"):
@@ -761,6 +889,8 @@ def test_find_exiftool_missing(tmp_path: Path) -> None:
 def test_find_exiftool_missing_suggests_renaming_keep_open_variant(tmp_path: Path) -> None:
     """
     Check that the error suggests renaming an ``exiftool(-k)`` executable.
+
+    :param tmp_path: Pytest temporary folder.
     """
     make_fake_exe(tmp_path / "bin" / "exiftool-13.62_64" / "exiftool(-k).exe")
     with pytest.raises(mr.ExifToolError, match="rename it to"):
@@ -799,6 +929,8 @@ def fake_run(stdout: str = "", stderr: str = "", returncode: int = 0, error: Opt
 def test_get_exiftool_version_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that the version printed by ExifTool is returned.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setattr(mr.subprocess, "run", fake_run(stdout="13.62\r\n"))
     assert mr.get_exiftool_version(Path("exiftool")) == "13.62"
@@ -816,6 +948,10 @@ def test_get_exiftool_version_ok(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_get_exiftool_version_errors(monkeypatch: pytest.MonkeyPatch, run: Any, expected: str) -> None:
     """
     Check that ExifTool failures raise ``ExifToolError``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param run: Fake ``subprocess.run`` simulating the failure.
+    :param expected: Part of the expected error message.
     """
     monkeypatch.setattr(mr.subprocess, "run", run)
     with pytest.raises(mr.ExifToolError, match=expected):
@@ -856,8 +992,10 @@ def checked_project(project: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_run_check_success(checked_project: Path) -> None:
     """
     Check that a valid setup passes and reports the ExifTool version and location.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
     """
-    code, out, err = run_check_captured(checked_project, timezone="Europe/Paris", environ={"PATH": ""})
+    code, out, err = run_check_captured(checked_project, cli_tz="Europe/Paris", environ={"PATH": ""})
     assert code == 0, err
     assert "ExifTool 13.62" in out and "exiftool-13.62_64" in out
     assert "0 device(s)" in out
@@ -878,6 +1016,12 @@ def test_run_check_reports_config_errors(
 ) -> None:
     """
     Check that ``--check`` fails explicitly on configuration errors.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
+    :param config_data: Content of the default configuration template.
+    :param file_name: Personal file to corrupt (``config.json`` or ``devices.json``).
+    :param content: Content to write: raw text, a JSON value, or ``None`` for a pattern with an unknown token.
+    :param expected: Part of the expected error message.
     """
     path = checked_project / "conf" / file_name
     if content is None:
@@ -895,8 +1039,10 @@ def test_run_check_reports_config_errors(
 def test_run_check_reports_bad_timezone(checked_project: Path) -> None:
     """
     Check that an invalid ``--tz`` value fails the check.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
     """
-    code, _, err = run_check_captured(checked_project, timezone="Mars/Olympus Mons", environ={"PATH": ""})
+    code, _, err = run_check_captured(checked_project, cli_tz="Mars/Olympus Mons", environ={"PATH": ""})
     assert code == 1
     assert "--tz" in err
 
@@ -904,6 +1050,9 @@ def test_run_check_reports_bad_timezone(checked_project: Path) -> None:
 def test_run_check_reports_timezone_database(checked_project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that ``--check`` reports the time zone database when it is available.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setattr(mr, "get_available_timezones", lambda: {"Europe/Paris", "UTC"})
     _, out, _ = run_check_captured(checked_project, environ={"PATH": ""})
@@ -915,9 +1064,12 @@ def test_run_check_degraded_without_timezone_database(
 ) -> None:
     """
     Check that a missing time zone database only yields warnings, even with ``--tz``.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr(mr, "zoneinfo", None)
-    code, out, err = run_check_captured(checked_project, timezone="Europe/Paris")
+    simulate_missing_timezone_database(monkeypatch)
+    code, out, err = run_check_captured(checked_project, cli_tz="Europe/Paris")
     assert "[WARNING] Time zone database" in out and "degraded mode" in out
     assert "[WARNING] --tz: time zone 'Europe/Paris' ignored" in out
     assert "--tz" not in err
@@ -927,6 +1079,8 @@ def test_run_check_degraded_without_timezone_database(
 def test_run_check_reports_missing_exiftool(project: Path) -> None:
     """
     Check that ``--check`` fails explicitly when ExifTool is missing.
+
+    :param project: Project root with the configuration templates.
     """
     mr.ensure_personal_files(project / "conf")
     code, out, err = run_check_captured(project, environ={"PATH": ""})
@@ -979,6 +1133,8 @@ def media_tree(tmp_path: Path) -> Path:
 def test_discover_files_flat(media_tree: Path) -> None:
     """
     Check that only the source folder is scanned without ``--recursive``, case-insensitively.
+
+    :param media_tree: Source folder with nested media and non-media files.
     """
     assert mr.discover_files(media_tree, [".jpg", ".mp4", ".mov"]) == [Path("a.mp4"), Path("b.JPG")]
 
@@ -986,6 +1142,8 @@ def test_discover_files_flat(media_tree: Path) -> None:
 def test_discover_files_recursive_keeps_relative_paths(media_tree: Path) -> None:
     """
     Check that a recursive scan keeps relative paths and skips ``.logs`` and excluded folders.
+
+    :param media_tree: Source folder with nested media and non-media files.
     """
     found = mr.discover_files(media_tree, [".jpg", ".mp4", ".mov"], recursive=True,
                               excluded_dirs=[media_tree / "out"])
@@ -995,6 +1153,8 @@ def test_discover_files_recursive_keeps_relative_paths(media_tree: Path) -> None
 def test_discover_files_recursive_without_exclusion(media_tree: Path) -> None:
     """
     Check that a destination is only skipped when excluded.
+
+    :param media_tree: Source folder with nested media and non-media files.
     """
     found = mr.discover_files(media_tree, [".jpg"], recursive=True)
     assert Path("out/g.jpg") in found and Path(".logs/f.jpg") not in found
@@ -1003,6 +1163,8 @@ def test_discover_files_recursive_without_exclusion(media_tree: Path) -> None:
 def test_discover_files_missing_source(tmp_path: Path) -> None:
     """
     Check that a missing source folder raises ``NotADirectoryError``.
+
+    :param tmp_path: Pytest temporary folder.
     """
     with pytest.raises(NotADirectoryError, match="source folder not found"):
         mr.discover_files(tmp_path / "missing", [".jpg"])
@@ -1057,6 +1219,9 @@ def test_parse_exiftool_output_splits_results() -> None:
 def test_parse_exiftool_output_invalid(stdout: str, expected: str) -> None:
     """
     Check that unusable output marks every file as failed.
+
+    :param stdout: Invalid output of ExifTool.
+    :param expected: Part of the error given to every file.
     """
     metadata, errors = mr.parse_exiftool_output(stdout, "", [Path("/d/a.jpg")])
     assert metadata == {} and expected in errors[Path("/d/a.jpg")]
@@ -1065,6 +1230,9 @@ def test_parse_exiftool_output_invalid(stdout: str, expected: str) -> None:
 def test_run_exiftool_batch_uses_argfile(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """
     Check that file names are passed in a UTF-8 argument file, removed afterwards.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temporary folder.
     """
     path = tmp_path / "été.jpg"
     seen = {}  # type: Dict[str, Any]
@@ -1092,6 +1260,8 @@ def test_run_exiftool_batch_uses_argfile(monkeypatch: pytest.MonkeyPatch, tmp_pa
 def test_run_exiftool_batch_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that a timeout marks every file of the batch as failed.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setattr(mr.subprocess, "run", fake_run(error=subprocess.TimeoutExpired("exiftool", 5)))
     metadata, errors = mr.run_exiftool_batch(Path("exiftool"), [Path("/a.jpg"), Path("/b.jpg")], timeout=5)
@@ -1102,6 +1272,8 @@ def test_run_exiftool_batch_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_run_exiftool_batch_cannot_start(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that an ExifTool that cannot start raises ``ExifToolError``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setattr(mr.subprocess, "run", fake_run(error=FileNotFoundError("missing")))
     with pytest.raises(mr.ExifToolError, match="cannot be started"):
@@ -1111,6 +1283,8 @@ def test_run_exiftool_batch_cannot_start(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_read_metadata_batches(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that files are split into batches and results merged.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     calls = []
 
@@ -1159,6 +1333,9 @@ def test_read_metadata_batches(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_parse_exif_datetime(value: Any, expected: Optional[datetime]) -> None:
     """
     Check valid, partial, zoned and invalid ExifTool dates.
+
+    :param value: Tag value returned by ExifTool.
+    :param expected: Expected date, or ``None`` when the value is not a valid date.
     """
     assert mr.parse_exif_datetime(value) == expected
 
@@ -1207,6 +1384,9 @@ def test_select_capture_date_uses_offset_tags() -> None:
 def test_parse_utc_offset(value: Any, expected: Optional[timedelta]) -> None:
     """
     Check valid and invalid UTC offsets.
+
+    :param value: Offset text.
+    :param expected: Expected offset from UTC, or ``None`` when the text is not a valid offset.
     """
     zone = mr.parse_utc_offset(value)
     assert (zone.utcoffset(None) if zone else None) == expected
@@ -1234,6 +1414,10 @@ def test_parse_utc_offset(value: Any, expected: Optional[timedelta]) -> None:
 def test_apply_offset(date: datetime, offset: str, expected: datetime) -> None:
     """
     Check positive and negative offsets with day, month, year and leap-day rollovers.
+
+    :param date: Date read from the metadata.
+    :param offset: Signed ``HH:MM:SS`` offset.
+    :param expected: Expected corrected date.
     """
     assert mr.apply_offset(date, offset) == expected
 
@@ -1267,6 +1451,8 @@ def paris() -> Any:
 def test_load_zone(paris: Any) -> None:
     """
     Check that a known zone loads and that unknown zones are reported.
+
+    :param paris: The ``Europe/Paris`` time zone.
     """
     assert str(paris) == "Europe/Paris"
     with pytest.raises(ValueError, match="not found"):
@@ -1276,6 +1462,9 @@ def test_load_zone(paris: Any) -> None:
 def test_check_cli_timezone(paris: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check syntax errors, unknown zones and a missing time zone database for ``--tz``.
+
+    :param paris: The ``Europe/Paris`` time zone.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     assert mr.check_cli_timezone("Europe/Paris") == (None, None)
     error, warning = mr.check_cli_timezone("not a zone")
@@ -1287,6 +1476,8 @@ def test_check_cli_timezone(paris: Any, monkeypatch: pytest.MonkeyPatch) -> None
 def test_check_cli_timezone_load_error_with_database(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that a zone that fails to load from an available database is an error.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     def failing_load_zone(name: str) -> Any:
         """
@@ -1306,21 +1497,25 @@ def test_check_cli_timezone_load_error_with_database(monkeypatch: pytest.MonkeyP
 def test_check_cli_timezone_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that, without a time zone database, a valid ``--tz`` only yields a warning.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr(mr, "zoneinfo", None)
+    simulate_missing_timezone_database(monkeypatch)
     error, warning = mr.check_cli_timezone("Europe/Paris")
     assert error is None
-    assert "ignored, local times kept" in warning and "Python 3.9" in warning
+    assert "ignored, local times kept" in warning and "tzdata" in warning
     error, warning = mr.check_cli_timezone("not a zone")
     assert "invalid time zone" in error and warning is None
 
 
-def test_load_zone_without_zoneinfo(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_zone_without_database(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Check the error raised when ``zoneinfo`` is unavailable (Python 3.8).
+    Check the error raised when no time zone database is available.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr(mr, "zoneinfo", None)
-    with pytest.raises(ValueError, match="Python 3.9"):
+    simulate_missing_timezone_database(monkeypatch)
+    with pytest.raises(ValueError, match="not found in the time zone database"):
         mr.load_zone("Europe/Paris")
 
 
@@ -1337,6 +1532,10 @@ def test_load_zone_without_zoneinfo(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_classify_local_time(paris: Any, local: datetime, expected: str) -> None:
     """
     Check normal, ambiguous (clocks set back) and non-existent (clocks set forward) local times.
+
+    :param paris: The ``Europe/Paris`` time zone.
+    :param local: Naive local date and time.
+    :param expected: Expected classification (``LOCAL_TIME_*``).
     """
     assert mr.classify_local_time(local, paris) == expected
 
@@ -1362,6 +1561,8 @@ def test_compute_effective_date_without_zone() -> None:
 def test_compute_effective_date_with_device_zone(paris: Any) -> None:
     """
     Check normalization to UTC with the device zone, offset applied first (winter and summer).
+
+    :param paris: The ``Europe/Paris`` time zone.
     """
     device = make_device(timezone="Europe/Paris")
     winter = mr.compute_effective_date(datetime(2024, 1, 2, 3, 4, 5), device)
@@ -1374,6 +1575,8 @@ def test_compute_effective_date_with_device_zone(paris: Any) -> None:
 def test_compute_effective_date_with_cli_zone(paris: Any) -> None:
     """
     Check that ``--tz`` overrides the device zone.
+
+    :param paris: The ``Europe/Paris`` time zone.
     """
     device = make_device(offset="+00:00:00", timezone="Asia/Tokyo")
     effective = mr.compute_effective_date(datetime(2024, 1, 2, 12, 0, 0), device, "Europe/Paris")
@@ -1401,6 +1604,10 @@ def test_compute_effective_date_with_metadata_offset() -> None:
 def test_compute_effective_date_dst_warnings(paris: Any, local: datetime, expected: str) -> None:
     """
     Check that ambiguous and non-existent times (after the offset) are kept local with a warning.
+
+    :param paris: The ``Europe/Paris`` time zone.
+    :param local: Date read from the file, before the one-hour device offset.
+    :param expected: Part of the expected warning.
     """
     effective = mr.compute_effective_date(local, make_device(), "Europe/Paris")
     assert effective.value == local - timedelta(hours=1)
@@ -1412,8 +1619,10 @@ def test_compute_effective_date_dst_warnings(paris: Any, local: datetime, expect
 def test_compute_effective_date_unavailable_zone(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that a zone missing from the database keeps the local time with a warning.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr(mr, "zoneinfo", None)
+    simulate_missing_timezone_database(monkeypatch)
     effective = mr.compute_effective_date(datetime(2024, 1, 2, 3, 4, 5), make_device(timezone="Europe/Paris"))
     assert effective.value == datetime(2024, 1, 2, 2, 4, 5)
     assert "local time kept" in effective.warnings[0]
@@ -1487,6 +1696,10 @@ def test_analyze_file_keeps_software_of_unknown_device() -> None:
 def test_device_matches(match: Dict[str, str], identity: Any, expected: bool) -> None:
     """
     Check case-insensitivity, optional serial number and missing file values.
+
+    :param match: ``match`` criteria of the device.
+    :param identity: Tuple ``(make, model, serial_number)`` read from the file.
+    :param expected: Whether the device must match.
     """
     assert mr.device_matches(make_device(match=match), mr.DeviceIdentity(*identity)) is expected
 
@@ -1595,14 +1808,12 @@ def test_describe_device() -> None:
                          match={"make": "GoPro", "model": "HERO9 Black", "serial_number": "C3441326974391"})
     assert mr.describe_device(device) == (
         "'gopro-1' (label 'Ma GoPro'; Make 'GoPro', Model 'HERO9 Black', serial ***4391)")
-    assert mr.describe_device(device, show_serial=False) == (
-        "'gopro-1' (label 'Ma GoPro'; Make 'GoPro', Model 'HERO9 Black')")
     assert mr.describe_device({"id": "x", "label": "X", "match": {}}) == "'x' (label 'X')"
 
 
 def test_format_unknown_forced_device_error() -> None:
     """
-    Check that the ``--device`` error lists the known devices without serial numbers.
+    Check that the ``--device`` error lists the known devices, with masked serial numbers.
     """
     devices = [make_device(id="a7", label="Sony", match={"make": "SONY", "model": "ILCE-7M3",
                                                          "serial_number": "123456789"})]
@@ -1610,9 +1821,9 @@ def test_format_unknown_forced_device_error() -> None:
     assert text.splitlines() == [
         "--device: unknown device id 'nope'",
         "Known devices:",
-        "  - 'a7' (label 'Sony'; Make 'SONY', Model 'ILCE-7M3')",
+        "  - 'a7' (label 'Sony'; Make 'SONY', Model 'ILCE-7M3', serial ***6789)",
     ]
-    assert "6789" not in text
+    assert "123456789" not in text
     assert "No device is registered" in mr.format_unknown_forced_device_error("nope", [])
 
 
@@ -1633,6 +1844,9 @@ def test_default_label() -> None:
     assert mr.default_label(mr.DeviceIdentity("GoPro", "HERO9: Black", "")) == "HERO9 Black"
     assert mr.default_label(mr.DeviceIdentity("NIKON", "", "")) == "NIKON"
     assert mr.default_label(mr.DeviceIdentity("", "", "")) == "Device"
+    assert mr.default_label(mr.DeviceIdentity("", ". HERO9 Black. ", "")) == "HERO9 Black"
+    assert mr.default_label(mr.DeviceIdentity("", "...", "")) == "Device"
+    assert mr.validate_label(mr.default_label(mr.DeviceIdentity("", " .a:b. ", ""))) == []
 
 
 def test_answer_validators() -> None:
@@ -1642,6 +1856,7 @@ def test_answer_validators() -> None:
     assert mr.validate_label_answer("GoPro9") is None
     assert "empty" in mr.validate_label_answer("")
     assert "invalid" in mr.validate_label_answer("a/b")
+    assert "'.'" in mr.validate_label_answer("GoPro.")
     assert mr.validate_offset_answer("-01:00:00") is None
     assert "invalid offset" in mr.validate_offset_answer("1h")
     assert mr.validate_timezone_answer("") is None
@@ -1734,6 +1949,8 @@ def test_format_unknown_devices_error() -> None:
 def test_resolve_unknown_devices_nothing_to_do(tmp_path: Path) -> None:
     """
     Check that nothing is asked nor written when every device is known.
+
+    :param tmp_path: Pytest temporary folder.
     """
     analyses = [mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [make_device()])]
     result, devices = mr.resolve_unknown_devices(analyses, [make_device()], tmp_path / "devices.json",
@@ -1745,6 +1962,8 @@ def test_resolve_unknown_devices_nothing_to_do(tmp_path: Path) -> None:
 def test_resolve_unknown_devices_non_interactive(tmp_path: Path) -> None:
     """
     Check that a non-interactive run with unknown devices raises a clear error.
+
+    :param tmp_path: Pytest temporary folder.
     """
     with pytest.raises(mr.UnknownDeviceError, match="no interactive terminal"):
         mr.resolve_unknown_devices([make_unknown("a.jpg", "GoPro", "HERO9")], [], tmp_path / "devices.json",
@@ -1754,6 +1973,8 @@ def test_resolve_unknown_devices_non_interactive(tmp_path: Path) -> None:
 def test_resolve_unknown_devices_closed_input(tmp_path: Path) -> None:
     """
     Check that a closed input stream is reported like a non-interactive run.
+
+    :param tmp_path: Pytest temporary folder.
     """
     with pytest.raises(mr.UnknownDeviceError):
         mr.resolve_unknown_devices([make_unknown("a.jpg", "GoPro", "HERO9")], [], tmp_path / "devices.json",
@@ -1766,6 +1987,8 @@ def test_resolve_unknown_devices_asks_once_per_device(tmp_path: Path) -> None:
 
     The video has no make nor serial number, the photos have both: a single
     question must cover all of them.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = write_json(tmp_path / "devices.json", {"devices": [make_device(id="other", match={"model": "X"})]})
     analyses = [
@@ -1807,6 +2030,10 @@ def test_analyze_source_reads_without_modifying(
 ) -> None:
     """
     Check the whole analysis pipeline with faked metadata, and that sources are untouched.
+
+    :param media_tree: Source folder with nested media and non-media files.
+    :param tmp_path: Pytest temporary folder.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     seen = []
 
@@ -1834,6 +2061,9 @@ def test_analyze_source_reads_without_modifying(
 def test_analyze_source_empty_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that an empty folder does not call ExifTool.
+
+    :param tmp_path: Pytest temporary folder.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setattr(mr, "read_metadata", None)
     assert mr.analyze_source(tmp_path, [".jpg"], [], tmp_path / "devices.json", Path("exiftool")) == []
@@ -1862,6 +2092,8 @@ def test_print_analysis_hides_serial_numbers() -> None:
 def test_print_analysis_without_effective_date_and_with_warnings(paris: Any) -> None:
     """
     Check the fallback display without effective date, and the warning lines and count.
+
+    :param paris: The ``Europe/Paris`` time zone.
     """
     plain = mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [make_device()])
     out = io.StringIO()
@@ -1880,6 +2112,8 @@ def test_print_analysis_without_effective_date_and_with_warnings(paris: Any) -> 
 def test_describe_date_source(paris: Any) -> None:
     """
     Check the description of the date tag, the offset (hidden when zero) and the zone.
+
+    :param paris: The ``Europe/Paris`` time zone.
     """
     zero = make_device(offset="+00:00:00")
     analysis = mr.add_effective_dates([mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [zero])])[0]
@@ -1958,11 +2192,26 @@ def targets(entries: Any) -> Dict[str, Optional[str]]:
     return {entry.source.as_posix(): entry.target.as_posix() if entry.target else None for entry in entries}
 
 
+def test_build_plan_skips_auxiliaries_of_unnamable_main(tmp_path: Path) -> None:
+    """
+    Check that, when the name of a main video cannot be built, its auxiliary files are skipped with a warning.
+
+    :param tmp_path: Pytest temporary folder.
+    """
+    main = ready("GH010001.MP4")._replace(device=None)
+    plan = mr.build_plan([main, auxiliary("GH010001.THM"), auxiliary("GL010001.LRV")], "{DEVICE}", tmp_path)
+    assert targets(plan) == {"GH010001.MP4": None, "GH010001.THM": None, "GL010001.LRV": None}
+    assert [entry.action for entry in plan] == [mr.ACTION_SKIP] * 3
+    assert "no date or device" in plan[0].message
+    warning = "main video GH010001.MP4 is skipped; not renamed"
+    assert [(entry.message, entry.warnings) for entry in plan[1:]] == [(warning, (warning,))] * 2
+
+
 def test_sanitize_stem() -> None:
     """
     Check the deterministic replacement of invalid characters, dots, spaces and reserved names.
     """
-    assert mr.sanitize_stem("a<b>c:d\"e/f\\g|h?i*j\tk") == "a_b_c_d_e_f_g_h_i_j_k"
+    assert mr.sanitize_stem("a<b>c:d\"e/f\\g|h?i*j\tk\x7fl") == "a_b_c_d_e_f_g_h_i_j_k_l"
     assert mr.sanitize_stem(" ..name.. ") == "name"
     assert mr.sanitize_stem(" . ") == "_"
     assert mr.sanitize_stem("con") == "_con" and mr.sanitize_stem("COM1.x") == "_COM1.x"
@@ -2093,6 +2342,8 @@ def test_group_auxiliaries_duplicate_extension() -> None:
 def test_list_existing_names(tmp_path: Path) -> None:
     """
     Check that names are case-folded and that a missing folder is empty.
+
+    :param tmp_path: Pytest temporary folder.
     """
     (tmp_path / "A.JPG").write_bytes(b"")
     (tmp_path / "Sub").mkdir()
@@ -2116,6 +2367,8 @@ def test_resolve_collision() -> None:
 def test_build_plan_is_deterministic(tmp_path: Path) -> None:
     """
     Check that the same input, in any order, always yields the same plan.
+
+    :param tmp_path: Pytest temporary folder.
     """
     analyses = [ready("b.jpg"), ready("A.jpg"), ready("sub/c.mp4"), auxiliary("sub/c.thm"), ready("a2.jpg"),
                 skipped("z.mp4")]
@@ -2132,6 +2385,8 @@ def test_build_plan_is_deterministic(tmp_path: Path) -> None:
 def test_build_plan_collisions_inside_batch(tmp_path: Path) -> None:
     """
     Check suffixes for identical names and for names differing only by case.
+
+    :param tmp_path: Pytest temporary folder.
     """
     analyses = [ready("a.jpg"), ready("b.jpg"), ready("c.JPG"), ready("d.png"),
                 ready("e.jpg", label="gopro9")]
@@ -2143,6 +2398,8 @@ def test_build_plan_collisions_inside_batch(tmp_path: Path) -> None:
 def test_build_plan_collisions_with_existing_files(tmp_path: Path) -> None:
     """
     Check that existing files are never targeted, whatever their case, in place and in copy mode.
+
+    :param tmp_path: Pytest temporary folder.
     """
     (tmp_path / (BASE.upper() + ".JPG")).write_bytes(b"")
     (tmp_path / (BASE + "_01.jpg")).write_bytes(b"")
@@ -2158,6 +2415,8 @@ def test_build_plan_collisions_with_existing_files(tmp_path: Path) -> None:
 def test_build_plan_keeps_own_name(tmp_path: Path) -> None:
     """
     Check that an already renamed file keeps its name in place, and may change only its case.
+
+    :param tmp_path: Pytest temporary folder.
     """
     (tmp_path / (BASE + ".jpg")).write_bytes(b"")
     (tmp_path / "2024-01-02_03-04-05_GOPRO9.png").write_bytes(b"")
@@ -2171,6 +2430,8 @@ def test_build_plan_keeps_own_name(tmp_path: Path) -> None:
 def test_build_plan_auxiliary_files_follow_main_video(tmp_path: Path) -> None:
     """
     Check that ``.LRV``/``.THM`` take the final name of their main video, collision suffix included.
+
+    :param tmp_path: Pytest temporary folder.
     """
     (tmp_path / (BASE + ".THM")).write_bytes(b"")
     analyses = [ready("GH010001.MP4", warnings=["dst"]), auxiliary("GL010001.LRV"), auxiliary("GH010001.THM"),
@@ -2188,6 +2449,8 @@ def test_build_plan_auxiliary_files_follow_main_video(tmp_path: Path) -> None:
 def test_build_plan_subfolders_are_independent(tmp_path: Path) -> None:
     """
     Check that the same base name in two subfolders gives no cross-folder pairing or suffix.
+
+    :param tmp_path: Pytest temporary folder.
     """
     analyses = [ready("a/GH010001.MP4"), auxiliary("a/GH010001.THM"), ready("b/GH010001.MP4"),
                 auxiliary("c/GH010001.THM")]
@@ -2199,6 +2462,8 @@ def test_build_plan_subfolders_are_independent(tmp_path: Path) -> None:
 def test_build_plan_skips(tmp_path: Path) -> None:
     """
     Check the entries of skipped files and of files whose name cannot be built.
+
+    :param tmp_path: Pytest temporary folder.
     """
     analyses = [skipped("a.mp4"), ready("b.jpg")._replace(device=None)]
     plan = mr.build_plan(analyses, PATTERN, tmp_path)
@@ -2209,6 +2474,8 @@ def test_build_plan_skips(tmp_path: Path) -> None:
 def test_build_plan_touches_no_file(media_tree: Path) -> None:
     """
     Check that building a plan, in place or with a destination, creates or changes nothing.
+
+    :param media_tree: Source folder with nested media and non-media files.
     """
     before = snapshot(media_tree)
     folders = sorted(path for path in media_tree.rglob("*") if path.is_dir())
@@ -2257,6 +2524,11 @@ def test_print_plan() -> None:
 def test_should_apply(apply_flag: bool, dry_run_flag: bool, dry_run_by_default: bool, expected: bool) -> None:
     """
     Check that ``--dry-run`` and ``--apply`` win over ``dry_run_by_default``.
+
+    :param apply_flag: Value of ``--apply``.
+    :param dry_run_flag: Value of ``--dry-run``.
+    :param dry_run_by_default: Value of ``dry_run_by_default``.
+    :param expected: Whether the files must be changed.
     """
     assert mr.should_apply(apply_flag, dry_run_flag, dry_run_by_default) is expected
 
@@ -2273,6 +2545,8 @@ def test_build_arg_parser_apply_and_dry_run_are_exclusive() -> None:
 def test_is_same_file(tmp_path: Path) -> None:
     """
     Check the detection of a single file under two paths.
+
+    :param tmp_path: Pytest temporary folder.
     """
     first = tmp_path / "a.jpg"
     first.write_bytes(b"a")
@@ -2286,6 +2560,9 @@ def test_is_same_file(tmp_path: Path) -> None:
 def test_safe_rename(tmp_path: Path, use_hard_link: bool) -> None:
     """
     Check a rename with both strategies, and that an existing target is never overwritten.
+
+    :param tmp_path: Pytest temporary folder.
+    :param use_hard_link: Whether the hard link strategy is used.
     """
     source = tmp_path / "a.jpg"
     source.write_bytes(b"a")
@@ -2300,6 +2577,8 @@ def test_safe_rename(tmp_path: Path, use_hard_link: bool) -> None:
 def test_safe_rename_case_only(tmp_path: Path) -> None:
     """
     Check that a case-only rename works, also on case-insensitive file systems.
+
+    :param tmp_path: Pytest temporary folder.
     """
     (tmp_path / "A.JPG").write_bytes(b"a")
     mr.safe_rename(tmp_path / "A.JPG", tmp_path / "a.jpg", True)
@@ -2309,6 +2588,9 @@ def test_safe_rename_case_only(tmp_path: Path) -> None:
 def test_safe_rename_without_hard_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check the fallback for file systems without hard links (e.g. exFAT memory cards).
+
+    :param tmp_path: Pytest temporary folder.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     def no_link(source: str, target: str) -> None:
         """
@@ -2329,6 +2611,8 @@ def test_safe_rename_without_hard_links(tmp_path: Path, monkeypatch: pytest.Monk
 def test_safe_copy(tmp_path: Path) -> None:
     """
     Check that a copy creates the parent folders, keeps content and times, and never overwrites.
+
+    :param tmp_path: Pytest temporary folder.
     """
     source = tmp_path / "a.jpg"
     source.write_bytes(b"a")
@@ -2346,6 +2630,9 @@ def test_safe_copy(tmp_path: Path) -> None:
 def test_safe_copy_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that a missing source creates no folder and that a partial copy is removed.
+
+    :param tmp_path: Pytest temporary folder.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     with pytest.raises(FileNotFoundError):
         mr.safe_copy(tmp_path / "missing.jpg", tmp_path / "dest" / "b.jpg")
@@ -2372,6 +2659,8 @@ def test_safe_copy_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 def test_execute_plan_in_place(tmp_path: Path) -> None:
     """
     Check an in-place execution: renames, auxiliary files, unchanged and skipped entries.
+
+    :param tmp_path: Pytest temporary folder.
     """
     make_tree(tmp_path, ["GX01.MP4", "GX01.THM", "sub/c.jpg", "orphan.lrv", "bad.jpg", BASE + ".jpg"])
     analyses = [ready("GX01.MP4"), auxiliary("GX01.THM"), ready("sub/c.jpg"), auxiliary("orphan.lrv"),
@@ -2392,6 +2681,8 @@ def test_execute_plan_in_place(tmp_path: Path) -> None:
 def test_execute_plan_copy_never_overwrites(tmp_path: Path) -> None:
     """
     Check a copy execution: sources intact, no empty folder, a late existing target is not overwritten.
+
+    :param tmp_path: Pytest temporary folder.
     """
     source = tmp_path / "src"
     make_tree(source, ["a.jpg", "sub/b.jpg", "skipped/bad.jpg"])
@@ -2411,6 +2702,8 @@ def test_execute_plan_copy_never_overwrites(tmp_path: Path) -> None:
 def test_execute_plan_reports_os_errors(tmp_path: Path) -> None:
     """
     Check that a missing source file fails its entry with a readable message.
+
+    :param tmp_path: Pytest temporary folder.
     """
     plan = [mr.PlanEntry(Path("gone.jpg"), Path("x.jpg"), mr.ACTION_RENAME, "", ())]
     results = mr.execute_plan(plan, tmp_path)
@@ -2579,6 +2872,8 @@ def test_collect_secrets() -> None:
 def test_setup_logging(tmp_path: Path) -> None:
     """
     Check that the log file is created, appended to and filtered by level.
+
+    :param tmp_path: Pytest temporary folder.
     """
     logger, error = mr.setup_logging(tmp_path / ".logs", "INFO")
     assert error is None
@@ -2598,6 +2893,8 @@ def test_setup_logging(tmp_path: Path) -> None:
 def test_setup_logging_unwritable(tmp_path: Path) -> None:
     """
     Check that an unusable log folder disables the log file without failing.
+
+    :param tmp_path: Pytest temporary folder.
     """
     blocker = tmp_path / ".logs"
     blocker.write_text("not a folder", encoding="utf-8")
@@ -2626,6 +2923,8 @@ def test_get_privacy_filter_and_close_logging() -> None:
 def test_log_plan(memory_logger: Any) -> None:
     """
     Check the logged plan: planned operations at DEBUG, skips at INFO, warnings once at WARNING.
+
+    :param memory_logger: Tuple ``(logger, stream)``: the run logger and the stream it writes to.
     """
     logger, stream = memory_logger
     mr.log_plan(logger, summary_plan())
@@ -2643,6 +2942,8 @@ def test_log_plan(memory_logger: Any) -> None:
 def test_log_results(memory_logger: Any) -> None:
     """
     Check that performed operations are logged at INFO and failures at ERROR.
+
+    :param memory_logger: Tuple ``(logger, stream)``: the run logger and the stream it writes to.
     """
     logger, stream = memory_logger
     plan = summary_plan()
@@ -2664,6 +2965,8 @@ def test_log_results(memory_logger: Any) -> None:
 def test_log_summary(memory_logger: Any) -> None:
     """
     Check that the summary lines are logged at INFO, without indentation.
+
+    :param memory_logger: Tuple ``(logger, stream)``: the run logger and the stream it writes to.
     """
     logger, stream = memory_logger
     mr.log_summary(logger, mr.summarize_run(summary_plan()))
@@ -2675,6 +2978,9 @@ def test_log_summary(memory_logger: Any) -> None:
 def test_report_error_and_warning(memory_logger: Any, capsys: pytest.CaptureFixture) -> None:
     """
     Check that errors and warnings go to the standard error stream and to the log.
+
+    :param memory_logger: Tuple ``(logger, stream)``: the run logger and the stream it writes to.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     logger, stream = memory_logger
     mr.report_error(logger, "bad")
@@ -2686,6 +2992,8 @@ def test_report_error_and_warning(memory_logger: Any, capsys: pytest.CaptureFixt
 def test_load_devices_quietly(tmp_path: Path) -> None:
     """
     Check that devices are loaded and that an invalid file gives an empty list.
+
+    :param tmp_path: Pytest temporary folder.
     """
     path = write_json(tmp_path / "devices.json", {"devices": [make_device()]})
     assert [device["id"] for device in mr.load_devices_quietly(path)] == ["gopro9"]
@@ -2787,6 +3095,9 @@ def real_samples(tmp_path: Path, real_exiftool: Path) -> Path:
 def test_read_metadata_real_samples(real_samples: Path, real_exiftool: Path) -> None:
     """
     Check metadata extraction from real JPG, MP4 and DNG files (non-ASCII folder included).
+
+    :param real_samples: Source folder of real JPG, MP4 and DNG samples.
+    :param real_exiftool: Path of a working ExifTool.
     """
     paths = [real_samples / "été" / "GOPR0001.JPG", real_samples / "GH010001.MP4",
              real_samples / "raw" / "IMG_0001.DNG", real_samples / "missing.jpg"]
@@ -2801,6 +3112,10 @@ def test_read_metadata_real_samples(real_samples: Path, real_exiftool: Path) -> 
 def test_analyze_source_real_samples(real_samples: Path, real_exiftool: Path, tmp_path: Path) -> None:
     """
     Check the full analysis with ExifTool: one question per device, persisted, no source change.
+
+    :param real_samples: Source folder of real JPG, MP4 and DNG samples.
+    :param real_exiftool: Path of a working ExifTool.
+    :param tmp_path: Pytest temporary folder.
     """
     devices_path = write_json(tmp_path / "devices.json", {"devices": []})
     before = snapshot(real_samples)
@@ -2825,6 +3140,10 @@ def test_analyze_source_real_samples(real_samples: Path, real_exiftool: Path, tm
 def test_effective_dates_leave_metadata_unchanged(real_samples: Path, real_exiftool: Path, tmp_path: Path) -> None:
     """
     Check that offsets and time zones change the effective date only, never the files or their metadata.
+
+    :param real_samples: Source folder of real JPG, MP4 and DNG samples.
+    :param real_exiftool: Path of a working ExifTool.
+    :param tmp_path: Pytest temporary folder.
     """
     paths = sorted(path for path in real_samples.rglob("*") if path.is_file())
     metadata_before, _ = mr.read_metadata(real_exiftool, paths)
@@ -2848,6 +3167,8 @@ def test_effective_dates_leave_metadata_unchanged(real_samples: Path, real_exift
 def test_main_requires_source_without_check(project: Path) -> None:
     """
     Check that ``--source`` is required outside ``--check``.
+
+    :param project: Project root with the configuration templates.
     """
     with pytest.raises(SystemExit) as exc:
         mr.main([], project_root=project)
@@ -2859,6 +3180,9 @@ def test_main_check_creates_personal_files(
 ) -> None:
     """
     Check that a first run creates the personal files and ``--check`` succeeds.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     conf = checked_project / "conf"
     (conf / "config.json").unlink()
@@ -2872,6 +3196,9 @@ def test_main_check_creates_personal_files(
 def test_main_check_missing_template(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that a missing template makes ``main`` fail.
+
+    :param tmp_path: Pytest temporary folder.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     assert mr.main(["--check"], project_root=tmp_path) == 1
     assert "template" in capsys.readouterr().err
@@ -2880,6 +3207,9 @@ def test_main_check_missing_template(tmp_path: Path, capsys: pytest.CaptureFixtu
 def test_main_rename_missing_source(checked_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that a missing source folder is reported.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     assert mr.main(["--source", str(checked_project / "nope")], project_root=checked_project) == 1
     assert "folder not found" in capsys.readouterr().err
@@ -2917,6 +3247,9 @@ def analyzed_project(checked_project: Path, monkeypatch: pytest.MonkeyPatch) -> 
 def test_main_analysis_prompts_once_and_saves(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that an interactive run registers the unknown device once and prints the analysis.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     answers = iter(["GoPro9", "-01:00:00", ""])
     code = mr.main(["--source", str(analyzed_project / "src")], project_root=analyzed_project,
@@ -2933,6 +3266,9 @@ def test_main_analysis_prompts_once_and_saves(analyzed_project: Path, capsys: py
 def test_main_analysis_prints_copy_plan(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that ``--dest`` plans copies without creating the destination or touching the sources.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
     dest = analyzed_project / "dest"
@@ -2951,6 +3287,9 @@ def test_main_analysis_non_interactive_unknown_device(
 ) -> None:
     """
     Check that a non-interactive run with an unknown device fails clearly.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     code = mr.main(["--source", str(analyzed_project / "src")], project_root=analyzed_project, interactive=False)
     assert code == 1
@@ -2960,6 +3299,9 @@ def test_main_analysis_non_interactive_unknown_device(
 def test_main_analysis_forced_device(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that ``--device`` avoids prompts and that the default run only previews.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device(match={"model": "Other"})]})
     before = snapshot(analyzed_project / "src")
@@ -2988,6 +3330,9 @@ def plan_lines(out: str) -> Dict[str, str]:
 def test_main_apply_renames_in_place(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that ``--apply`` renames the files exactly as previewed.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
     source = analyzed_project / "src"
@@ -3009,6 +3354,9 @@ def test_main_apply_renames_in_place(analyzed_project: Path, capsys: pytest.Capt
 def test_main_apply_copies_to_destination(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that ``--dest`` with ``--apply`` creates the destination, copies and keeps the sources intact.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
     source = analyzed_project / "src"
@@ -3030,6 +3378,9 @@ def test_main_apply_copies_to_destination(analyzed_project: Path, capsys: pytest
 def test_main_apply_recursive(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that a recursive run keeps subfolders in place and recreates only non-empty folders under ``--dest``.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
     source = analyzed_project / "src"
@@ -3062,6 +3413,9 @@ def test_main_apply_resolves_unknown_devices_first(
     """
     Check that unknown devices are registered before any file is renamed, and that a
     non-interactive run with an unknown device changes nothing.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     source = analyzed_project / "src"
     before = snapshot(source)
@@ -3087,6 +3441,9 @@ def test_main_apply_resolves_unknown_devices_first(
 def test_main_dry_run_by_default_false(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that ``dry_run_by_default: false`` applies without ``--apply`` and that ``--dry-run`` still previews.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
     config_path = analyzed_project / "conf" / "config.json"
@@ -3107,6 +3464,10 @@ def test_main_apply_reports_errors(
 ) -> None:
     """
     Check that a failed operation is reported and makes the run exit with code 1.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
 
@@ -3133,6 +3494,10 @@ def test_main_analysis_applies_offset_and_tz(
 ) -> None:
     """
     Check that ``--tz`` normalizes the effective dates to UTC after the device offset.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
+    :param paris: The ``Europe/Paris`` time zone.
     """
     write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
     argv = ["--source", str(analyzed_project / "src"), "--tz", "Europe/Paris"]
@@ -3147,8 +3512,12 @@ def test_main_analysis_tz_without_database(
 ) -> None:
     """
     Check that, without a time zone database, ``--tz`` is ignored with a warning (degraded mode).
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr(mr, "zoneinfo", None)
+    simulate_missing_timezone_database(monkeypatch)
     write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
     argv = ["--source", str(analyzed_project / "src"), "--tz", "Europe/Paris"]
     assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
@@ -3162,8 +3531,12 @@ def test_main_analysis_device_tz_without_database(
 ) -> None:
     """
     Check that device time zones are announced as ignored once when no database is available.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr(mr, "zoneinfo", None)
+    simulate_missing_timezone_database(monkeypatch)
     write_json(analyzed_project / "conf" / "devices.json",
                {"devices": [make_device(timezone="Europe/Paris")]})
     argv = ["--source", str(analyzed_project / "src")]
@@ -3176,6 +3549,9 @@ def test_main_analysis_device_tz_without_database(
 def test_main_analysis_missing_exiftool(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that a missing ExifTool stops the analysis with a clear message.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     shutil.rmtree(str(analyzed_project / "bin"))
     code = mr.main(["--source", str(analyzed_project / "src")], project_root=analyzed_project,
@@ -3187,6 +3563,9 @@ def test_main_analysis_missing_exiftool(analyzed_project: Path, capsys: pytest.C
 def test_main_rename_invalid_config(checked_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that a rename run stops on an invalid configuration.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     (checked_project / "conf" / "devices.json").write_text("[", encoding="utf-8")
     assert mr.main(["--source", "in"], project_root=checked_project) == 1
@@ -3196,6 +3575,9 @@ def test_main_rename_invalid_config(checked_project: Path, capsys: pytest.Captur
 def test_main_rename_unknown_device(checked_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that an unknown ``--device`` id is rejected.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     assert mr.main(["--source", "in", "--device", "nope"], project_root=checked_project) == 1
     assert "unknown device id" in capsys.readouterr().err
@@ -3204,6 +3586,9 @@ def test_main_rename_unknown_device(checked_project: Path, capsys: pytest.Captur
 def test_main_rename_invalid_tz(checked_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that an invalid ``--tz`` value is rejected.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     assert mr.main(["--source", "in", "--tz", "not a zone"], project_root=checked_project) == 1
     assert "--tz" in capsys.readouterr().err
@@ -3264,6 +3649,9 @@ def read_log(project: Path) -> str:
 def test_main_summary_matches_operations(private_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that the printed and logged summaries match the files actually renamed and skipped.
+
+    :param private_project: Project whose files carry a serial number and GPS coordinates.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     source = private_project / "src"
     assert mr.main(["--source", str(source)], project_root=private_project, interactive=False) == 0
@@ -3291,6 +3679,9 @@ def test_main_summary_matches_operations(private_project: Path, capsys: pytest.C
 def test_main_never_exposes_gps_or_serial(private_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that neither the console nor the DEBUG log shows GPS coordinates or full serial numbers.
+
+    :param private_project: Project whose files carry a serial number and GPS coordinates.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     source = private_project / "src"
     assert mr.main(["--source", str(source), "--apply"], project_root=private_project, interactive=False) == 0
@@ -3304,6 +3695,9 @@ def test_main_never_exposes_gps_or_serial(private_project: Path, capsys: pytest.
 def test_main_logs_errors(private_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that a run failing after the configuration is loaded logs its error.
+
+    :param private_project: Project whose files carry a serial number and GPS coordinates.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     assert mr.main(["--source", str(private_project / "nope")], project_root=private_project) == 1
     assert "folder not found" in capsys.readouterr().err
@@ -3315,6 +3709,9 @@ def test_main_unknown_device_error_masks_serial(
 ) -> None:
     """
     Check that an unregistered device is reported with a masked serial, on the console and in the log.
+
+    :param private_project: Project whose files carry a serial number and GPS coordinates.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     write_json(private_project / "conf" / "devices.json", {"devices": []})
     assert mr.main(["--source", str(private_project / "src")], project_root=private_project,
@@ -3328,6 +3725,9 @@ def test_main_unknown_device_error_masks_serial(
 def test_main_log_file_disabled(private_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that a run goes on with a warning when the log file cannot be created.
+
+    :param private_project: Project whose files carry a serial number and GPS coordinates.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     (private_project / mr.LOGS_DIR_NAME).write_text("not a folder", encoding="utf-8")
     assert mr.main(["--source", str(private_project / "src")], project_root=private_project,
@@ -3340,6 +3740,10 @@ def test_main_log_file_disabled(private_project: Path, capsys: pytest.CaptureFix
 def test_run_batch_invalid_device(private_project: Path, capsys: pytest.CaptureFixture, memory_logger: Any) -> None:
     """
     Check that ``run_batch`` reports an unknown ``--device`` id to the console and the log.
+
+    :param private_project: Project whose files carry a serial number and GPS coordinates.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
+    :param memory_logger: Tuple ``(logger, stream)``: the run logger and the stream it writes to.
     """
     logger, stream = memory_logger
     args = mr.build_arg_parser().parse_args(["--source", "src", "--device", "nope"])
@@ -3409,6 +3813,10 @@ def test_corrupt_files_are_skipped_and_run_completes(corrupt_samples: Path, real
                                                      tmp_path: Path) -> None:
     """
     Check that corrupt, empty and truncated files are skipped with a reason, while the valid file is copied.
+
+    :param corrupt_samples: Source folder with one valid photo and corrupt media files.
+    :param real_exiftool: Path of a working ExifTool.
+    :param tmp_path: Pytest temporary folder.
     """
     devices = [make_device(match={"make": "GoPro", "model": "HERO9 Black"}, offset="+00:00:00")]
     devices_path = write_json(tmp_path / "devices.json", {"devices": devices})
@@ -3445,6 +3853,12 @@ def test_main_check_rejects_invalid_configs(checked_project: Path, capsys: pytes
                                             name: str, content: bytes, expected: str) -> None:
     """
     Check that empty, badly encoded and ill-formed configuration files fail ``--check`` with a message.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
+    :param name: Personal file to overwrite.
+    :param content: Raw bytes written to it.
+    :param expected: Part of the expected error message.
     """
     (checked_project / "conf" / name).write_bytes(content)
     assert mr.main(["--check"], project_root=checked_project) == 1
@@ -3454,6 +3868,9 @@ def test_main_check_rejects_invalid_configs(checked_project: Path, capsys: pytes
 def test_main_check_rejects_config_folder(checked_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that a folder standing in place of ``config.json`` is reported, not a crash.
+
+    :param checked_project: Project with personal files and a fake ExifTool.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
     """
     config = checked_project / "conf" / "config.json"
     config.unlink()
@@ -3465,6 +3882,9 @@ def test_main_check_rejects_config_folder(checked_project: Path, capsys: pytest.
 def test_execute_plan_permission_denied(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that a permission error fails its entry only, with a readable message, and the run goes on.
+
+    :param tmp_path: Pytest temporary folder.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     make_tree(tmp_path, ["a.jpg", "b.jpg"])
     plan = mr.build_plan([ready("a.jpg"), ready("b.jpg", when=WHEN + timedelta(seconds=1))], PATTERN, tmp_path)
@@ -3503,6 +3923,9 @@ def test_execute_plan_permission_denied(tmp_path: Path, monkeypatch: pytest.Monk
 def test_execute_plan_copy_unreadable_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check that a source that cannot be opened fails its copy without creating any file.
+
+    :param tmp_path: Pytest temporary folder.
+    :param monkeypatch: Pytest monkeypatch fixture.
     """
     source = tmp_path / "src"
     make_tree(source, ["a.jpg"])
@@ -3534,6 +3957,8 @@ def test_execute_plan_copy_unreadable_source(tmp_path: Path, monkeypatch: pytest
 def test_execute_plan_copy_file_in_place_of_folder(tmp_path: Path) -> None:
     """
     Check that a file standing where a destination folder is needed is not reported as an existing target.
+
+    :param tmp_path: Pytest temporary folder.
     """
     source = tmp_path / "src"
     make_tree(source, ["sub/a.jpg"])
@@ -3549,6 +3974,8 @@ def test_execute_plan_copy_file_in_place_of_folder(tmp_path: Path) -> None:
 def test_safe_copy_file_in_place_of_folder(tmp_path: Path) -> None:
     """
     Check that ``safe_copy`` raises ``NotADirectoryError`` when the target folder is a file.
+
+    :param tmp_path: Pytest temporary folder.
     """
     make_tree(tmp_path, ["a.jpg", "sub"])
     with pytest.raises(NotADirectoryError):
@@ -3560,6 +3987,8 @@ def test_safe_copy_file_in_place_of_folder(tmp_path: Path) -> None:
 def test_execute_plan_read_only_folder_posix(tmp_path: Path) -> None:
     """
     Check a real permission error: files of a read-only folder cannot be renamed and stay intact.
+
+    :param tmp_path: Pytest temporary folder.
     """
     make_tree(tmp_path, ["locked/a.jpg"])
     plan = mr.build_plan([ready("locked/a.jpg")], PATTERN, tmp_path)
@@ -3576,6 +4005,8 @@ def test_execute_plan_read_only_folder_posix(tmp_path: Path) -> None:
 def test_execute_plan_locked_file_windows(tmp_path: Path) -> None:
     """
     Check a real permission error: a file opened by another program cannot be renamed.
+
+    :param tmp_path: Pytest temporary folder.
     """
     make_tree(tmp_path, ["a.jpg"])
     plan = mr.build_plan([ready("a.jpg")], PATTERN, tmp_path)
@@ -3614,6 +4045,9 @@ def test_execute_plan_locked_file_windows(tmp_path: Path) -> None:
 def test_parse_exif_datetime_variants(value: str, expected: Optional[datetime]) -> None:
     """
     Check more EXIF and QuickTime date variants: sub-seconds, zones, separators, partial and impossible values.
+
+    :param value: Tag value returned by ExifTool.
+    :param expected: Expected date, or ``None`` when the value is not a valid date.
     """
     assert mr.parse_exif_datetime(value) == expected
 
@@ -3636,6 +4070,9 @@ def test_parse_exif_datetime_variants(value: str, expected: Optional[datetime]) 
 def test_select_capture_date_variants(metadata: Dict[str, str], expected: Any) -> None:
     """
     Check date selection with zero QuickTime dates, offset tags, sub-seconds and missing seconds.
+
+    :param metadata: Tags returned by ExifTool.
+    :param expected: Expected ``(tag, date)``, or ``None`` without a valid date.
     """
     assert mr.select_capture_date(metadata) == expected
 
@@ -3643,6 +4080,9 @@ def test_select_capture_date_variants(metadata: Dict[str, str], expected: Any) -
 def test_real_date_variants(tmp_path: Path, real_exiftool: Path) -> None:
     """
     Check dates written by ExifTool: offset and sub-seconds in a JPG, zero date in an MP4.
+
+    :param tmp_path: Pytest temporary folder.
+    :param real_exiftool: Path of a working ExifTool.
     """
     photo = tmp_path / "photo.jpg"
     photo.write_bytes(MINIMAL_JPEG)
@@ -3697,6 +4137,8 @@ def test_sanitize_stem_long_and_unicode_names() -> None:
 def test_build_plan_collision_ignores_unicode_normalization(tmp_path: Path) -> None:
     """
     Check that an existing name written in decomposed Unicode is seen as taken by a composed target.
+
+    :param tmp_path: Pytest temporary folder.
     """
     make_tree(tmp_path, ["a.jpg", "Été_GoPro9.jpg"])
     plan = mr.build_plan([ready("a.jpg")], "Été_{DEVICE}", tmp_path)
@@ -3706,6 +4148,8 @@ def test_build_plan_collision_ignores_unicode_normalization(tmp_path: Path) -> N
 def test_apply_long_names(tmp_path: Path) -> None:
     """
     Check a real rename of files whose rendered names would exceed the file system limits.
+
+    :param tmp_path: Pytest temporary folder.
     """
     originals = ["é" * 120 + ".jpg", "é" * 119 + "x.jpg"]
     make_tree(tmp_path, originals)
@@ -3722,6 +4166,9 @@ def test_apply_long_names(tmp_path: Path) -> None:
 def test_apply_special_characters(tmp_path: Path, copy: bool) -> None:
     """
     Check real renames and copies of names with spaces, accents, emoji, punctuation and a non-ASCII folder.
+
+    :param tmp_path: Pytest temporary folder.
+    :param copy: Copy to a destination when ``True``, rename in place otherwise.
     """
     source = tmp_path / "src"
     folder = "été 2024/"
@@ -3744,6 +4191,8 @@ def test_apply_special_characters(tmp_path: Path, copy: bool) -> None:
 def test_apply_invalid_characters_from_original(tmp_path: Path) -> None:
     """
     Check that characters invalid on some systems, taken from ``{ORIGINAL}``, never reach the file system.
+
+    :param tmp_path: Pytest temporary folder.
     """
     stem = mr.render_stem("{DEVICE}_{ORIGINAL}", WHEN, "GoPro9", 'x<y>z:"w|v?u*\x01')
     assert stem == "GoPro9_x_y_z__w_v_u__"

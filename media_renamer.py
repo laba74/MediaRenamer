@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+import zoneinfo
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
@@ -28,11 +29,6 @@ from typing import (
     Tuple,
     Union,
 )
-
-try:
-    import zoneinfo
-except ImportError:  # pragma: no cover - Python 3.8 has no zoneinfo module
-    zoneinfo = None  # type: ignore[assignment]
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -120,6 +116,8 @@ MAIN_VIDEO_EXTENSIONS = (".mp4", ".mov")
 # GoPro HERO6+ names the low-resolution video GL<n>.LRV next to GH<n>.MP4 / GX<n>.MP4.
 GOPRO_LRV_PREFIX = "gl"
 GOPRO_VIDEO_PREFIXES = ("gh", "gx")
+# Warning of an auxiliary file whose main video is skipped.
+MAIN_SKIPPED_WARNING = "main video {} is skipped; not renamed"
 WINDOWS_RESERVED_NAMES = frozenset(
     ["CON", "PRN", "AUX", "NUL"]
     + ["COM{}".format(index) for index in range(1, 10)]
@@ -323,14 +321,17 @@ def find_invalid_filename_chars(text: str) -> List[str]:
     """
     List the characters of a text that are not allowed in file names.
 
-    Forbidden characters are the Windows reserved ones and control characters.
+    Forbidden characters are those refused by at least one common system, so
+    that names stay portable: the Windows reserved characters (also refused on
+    FAT/exFAT memory cards, Android included, and ``:`` on macOS), control
+    characters and DEL.
 
     :param text: Text to inspect.
     :return: Distinct offending characters, in order of first appearance.
     """
     found = []
     for char in text:
-        if (char in INVALID_FILENAME_CHARS or ord(char) < 32) and char not in found:
+        if (char in INVALID_FILENAME_CHARS or ord(char) < 32 or ord(char) == 127) and char not in found:
             found.append(char)
     return found
 
@@ -473,10 +474,8 @@ def get_available_timezones() -> Set[str]:
     Return the IANA time zones known to the local time zone database.
 
     :return: Known zone names; empty when no database is available
-        (e.g. Windows without the ``tzdata`` package, or Python 3.8).
+        (e.g. Windows without the optional ``tzdata`` package).
     """
-    if zoneinfo is None:
-        return set()
     try:
         return set(zoneinfo.available_timezones())
     except Exception:  # pragma: no cover - defensive, depends on the platform
@@ -487,7 +486,7 @@ def has_timezone_database() -> bool:
     """
     Tell whether a time zone database is available.
 
-    Without one (Windows without the ``tzdata`` package, or Python 3.8), the
+    Without one (e.g. Windows without the optional ``tzdata`` package), the
     program runs in degraded mode: zones cannot be applied and local times are kept.
 
     :return: ``True`` when at least one IANA zone is known.
@@ -501,9 +500,7 @@ def describe_missing_timezone_database() -> str:
 
     :return: Human-readable explanation.
     """
-    if zoneinfo is None:
-        return "no time zone database available: Python 3.9+ is required"
-    return "no time zone database found (on Windows, install the 'tzdata' package, e.g. with 'uv sync')"
+    return "no time zone database found (on Windows, install the optional 'tzdata' package, e.g. with 'uv sync')"
 
 
 def validate_timezone(name: Any, available: Optional[Set[str]] = None) -> Optional[str]:
@@ -523,6 +520,35 @@ def validate_timezone(name: Any, available: Optional[Set[str]] = None) -> Option
     if known and name not in known:
         return "unknown time zone {!r} (expected an IANA name such as 'Europe/Paris')".format(name)
     return None
+
+
+def validate_label(label: Any) -> List[str]:
+    """
+    Validate a device label, inserted in file names by ``{DEVICE}``.
+
+    The label must be valid in file names on every common system (Windows,
+    macOS, Linux, Android): no forbidden character (see
+    ``find_invalid_filename_chars``), and no leading or trailing space or dot,
+    which some systems strip or refuse.
+
+    :param label: Label to check.
+    :return: Error messages; empty when the label is valid.
+    """
+    if not isinstance(label, str) or not label.strip():
+        return ["'label' must be a non-empty string"]
+    errors = []
+    invalid = find_invalid_filename_chars(label)
+    if invalid:
+        errors.append(
+            "'label' contains invalid file name characters: {}".format(
+                " ".join(repr(char) for char in invalid)
+            )
+        )
+    if label != label.strip():
+        errors.append("'label' must not start or end with a space")
+    if label.startswith(".") or label.endswith("."):
+        errors.append("'label' must not start or end with '.'")
+    return errors
 
 
 def validate_match(match: Any) -> List[str]:
@@ -565,17 +591,7 @@ def validate_device(device: Any, available_timezones: Optional[Set[str]] = None)
     if "id" in device and (not isinstance(device["id"], str) or not device["id"].strip()):
         errors.append("'id' must be a non-empty string")
     if "label" in device:
-        label = device["label"]
-        if not isinstance(label, str) or not label.strip():
-            errors.append("'label' must be a non-empty string")
-        else:
-            invalid = find_invalid_filename_chars(label)
-            if invalid:
-                errors.append(
-                    "'label' contains invalid file name characters: {}".format(
-                        " ".join(repr(char) for char in invalid)
-                    )
-                )
+        errors.extend(validate_label(device["label"]))
     if "match" in device:
         errors.extend(validate_match(device["match"]))
     if "offset" in device:
@@ -1115,14 +1131,12 @@ def load_zone(name: str) -> Any:
     :return: The ``zoneinfo.ZoneInfo`` object.
     :raises ValueError: If no time zone database is available or the zone is unknown.
     """
-    if zoneinfo is None:
-        raise ValueError("time zone {!r} cannot be used: Python 3.9+ is required".format(name))
     try:
         return zoneinfo.ZoneInfo(name)
     except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
         raise ValueError(
             "time zone {!r} not found in the time zone database "
-            "(on Windows, install the 'tzdata' package)".format(name)
+            "(on Windows, install the optional 'tzdata' package)".format(name)
         )
 
 
@@ -1449,7 +1463,7 @@ def describe_unknown_files(identity: DeviceIdentity, analyses: Iterable[FileAnal
     return lines
 
 
-def describe_device(device: Mapping[str, Any], show_serial: bool = True) -> str:
+def describe_device(device: Mapping[str, Any]) -> str:
     """
     Describe a device entry for the user: its id, completed by readable details.
 
@@ -1457,14 +1471,13 @@ def describe_device(device: Mapping[str, Any], show_serial: bool = True) -> str:
     the label and the ``match`` criteria (make, model) tell which camera it is.
 
     :param device: Device entry.
-    :param show_serial: Whether to show the masked serial number; disable it for text that reaches the log.
     :return: Text such as ``'hero9-black' (label 'HERO9 Black'; Make 'GoPro', Model 'HERO9 Black')``.
     """
     match = device.get("match") or {}
     identity = DeviceIdentity(
         clean_text(match.get("make")),
         clean_text(match.get("model")),
-        clean_text(match.get("serial_number")) if show_serial else "",
+        clean_text(match.get("serial_number")),
     )
     details = ["label '{}'".format(clean_text(device.get("label")))]
     if any(identity):
@@ -1476,7 +1489,7 @@ def format_unknown_forced_device_error(device_id: str, devices: Sequence[Mapping
     """
     Build the error shown when ``--device`` names an unknown id.
 
-    Serial numbers are left out because the message is also logged.
+    Serial numbers are masked, as everywhere else (see ``mask_serial``).
 
     :param device_id: Id given to ``--device``.
     :param devices: Known device entries.
@@ -1485,7 +1498,7 @@ def format_unknown_forced_device_error(device_id: str, devices: Sequence[Mapping
     lines = ["--device: unknown device id {!r}".format(device_id)]
     if devices:
         lines.append("Known devices:")
-        lines.extend("  - {}".format(describe_device(device, show_serial=False)) for device in devices)
+        lines.extend("  - {}".format(describe_device(device)) for device in devices)
     else:
         lines.append("No device is registered in conf/devices.json.")
     return "\n".join(lines)
@@ -1514,11 +1527,13 @@ def default_label(identity: DeviceIdentity) -> str:
     Suggest a device label from an identification.
 
     :param identity: Identification of the device.
-    :return: Model (or make) without invalid file name characters; ``"Device"`` as last resort.
+    :return: Model (or make) without invalid file name characters nor leading or
+        trailing spaces and dots, so that it passes ``validate_label``; ``"Device"`` as last resort.
     """
     text = identity.model or identity.make
     invalid = set(find_invalid_filename_chars(text))
-    return "".join(char for char in text if char not in invalid).strip() or "Device"
+    cleaned = "".join(char for char in text if char not in invalid)
+    return re.sub(r"^[\s.]+|[\s.]+$", "", cleaned) or "Device"
 
 
 def validate_label_answer(answer: str) -> Optional[str]:
@@ -1526,16 +1541,9 @@ def validate_label_answer(answer: str) -> Optional[str]:
     Validate a device label typed by the user.
 
     :param answer: Typed label.
-    :return: An error message, or ``None`` when the label is valid.
+    :return: An error message, or ``None`` when the label is valid (see ``validate_label``).
     """
-    if not answer:
-        return "the label must not be empty"
-    invalid = find_invalid_filename_chars(answer)
-    if invalid:
-        return "the label contains invalid file name characters: {}".format(
-            " ".join(repr(char) for char in invalid)
-        )
-    return None
+    return "; ".join(validate_label(answer)) or None
 
 
 def validate_offset_answer(answer: str) -> Optional[str]:
@@ -1866,8 +1874,8 @@ def sanitize_stem(stem: str) -> str:
     """
     Turn a rendered name (without extension) into a valid file name, deterministically.
 
-    The name is normalized to Unicode NFC; invalid file name characters and
-    control characters become ``_``; leading and trailing dots and spaces are
+    The name is normalized to Unicode NFC; invalid file name characters (see
+    ``find_invalid_filename_chars``) become ``_``; leading and trailing dots and spaces are
     removed; the name is cut to ``MAX_STEM_BYTES`` UTF-8 bytes (whole characters
     only); an empty result becomes ``_``; a Windows reserved device name
     (``CON``, ``NUL``, ``COM1``...) is prefixed with ``_``.
@@ -1876,7 +1884,8 @@ def sanitize_stem(stem: str) -> str:
     :return: Sanitized name.
     """
     cleaned = unicodedata.normalize("NFC", stem)
-    cleaned = "".join("_" if char in INVALID_FILENAME_CHARS or ord(char) < 32 else char for char in cleaned)
+    invalid = set(find_invalid_filename_chars(cleaned))
+    cleaned = "".join("_" if char in invalid else char for char in cleaned)
     cleaned = truncate_utf8(cleaned.strip(" ."), MAX_STEM_BYTES).strip(" .") or "_"
     if cleaned.split(".")[0].rstrip(" ").upper() in WINDOWS_RESERVED_NAMES:
         cleaned = "_" + cleaned
@@ -2040,7 +2049,7 @@ def group_auxiliaries(
             orphans[relative] = "no main video with the same base name in its folder; not renamed"
             continue
         if main.status != STATUS_READY:
-            orphans[relative] = "main video {} is skipped; not renamed".format(main.relative.name)
+            orphans[relative] = MAIN_SKIPPED_WARNING.format(main.relative.name)
             continue
         group = auxiliaries.setdefault(main.relative, [])
         used = {main.relative.suffix.casefold()} | {member.relative.suffix.casefold() for member in group}
@@ -2139,6 +2148,11 @@ def build_plan(
             base_stem = build_target_stem(analysis, pattern)
         except ValueError as error:
             entries[relative.as_posix()] = PlanEntry(relative, None, ACTION_SKIP, str(error), ())
+            # Its auxiliary files cannot take its name: skip them as well.
+            warning = MAIN_SKIPPED_WARNING.format(relative.name)
+            for member in auxiliaries.get(relative, []):
+                entries[member.relative.as_posix()] = PlanEntry(member.relative, None, ACTION_SKIP, warning,
+                                                                (warning,))
             continue
         group = [analysis] + auxiliaries.get(relative, [])
         key = folder_key(relative)
@@ -2623,7 +2637,7 @@ def report_warning(logger: logging.Logger, message: str) -> None:
 
 def run_check(
     project_root: Path,
-    timezone: Optional[str] = None,
+    cli_tz: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
     out: Optional[TextIO] = None,
     err: Optional[TextIO] = None,
@@ -2634,7 +2648,7 @@ def run_check(
     Every check runs, so all problems are reported at once.
 
     :param project_root: Project folder containing ``conf/`` and ``bin/``.
-    :param timezone: Optional ``--tz`` value to validate.
+    :param cli_tz: Optional ``--tz`` value to validate.
     :param environ: Environment variables; ``os.environ`` when ``None``.
     :param out: Stream for success messages; ``sys.stdout`` when ``None``.
     :param err: Stream for error messages; ``sys.stderr`` when ``None``.
@@ -2662,15 +2676,15 @@ def run_check(
     else:
         print("[WARNING] Time zone database: {}; degraded mode, local times are kept".format(
             describe_missing_timezone_database()), file=out)
-    if timezone is not None:
-        tz_error, tz_warning = check_cli_timezone(timezone)
+    if cli_tz is not None:
+        tz_error, tz_warning = check_cli_timezone(cli_tz)
         if tz_error:
             print("[ERROR] --tz: {}".format(tz_error), file=err)
             failed = True
         elif tz_warning:
             print("[WARNING] --tz: {}".format(tz_warning), file=out)
         else:
-            print("[OK] Time zone: {}".format(timezone), file=out)
+            print("[OK] Time zone: {}".format(cli_tz), file=out)
     try:
         executable = find_exiftool(project_root / BIN_DIR_NAME, environ)
         version = get_exiftool_version(executable)
