@@ -7,10 +7,13 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import unicodedata
+import zoneinfo
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
@@ -18,6 +21,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     NamedTuple,
@@ -28,11 +32,6 @@ from typing import (
     Tuple,
     Union,
 )
-
-try:
-    import zoneinfo
-except ImportError:  # pragma: no cover - Python 3.8 has no zoneinfo module
-    zoneinfo = None  # type: ignore[assignment]
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -120,6 +119,8 @@ MAIN_VIDEO_EXTENSIONS = (".mp4", ".mov")
 # GoPro HERO6+ names the low-resolution video GL<n>.LRV next to GH<n>.MP4 / GX<n>.MP4.
 GOPRO_LRV_PREFIX = "gl"
 GOPRO_VIDEO_PREFIXES = ("gh", "gx")
+# Warning of an auxiliary file whose main video is skipped.
+MAIN_SKIPPED_WARNING = "main video {} is skipped; not renamed"
 WINDOWS_RESERVED_NAMES = frozenset(
     ["CON", "PRN", "AUX", "NUL"]
     + ["COM{}".format(index) for index in range(1, 10)]
@@ -323,14 +324,17 @@ def find_invalid_filename_chars(text: str) -> List[str]:
     """
     List the characters of a text that are not allowed in file names.
 
-    Forbidden characters are the Windows reserved ones and control characters.
+    Forbidden characters are those refused by at least one common system, so
+    that names stay portable: the Windows reserved characters (also refused on
+    FAT/exFAT memory cards, Android included, and ``:`` on macOS), control
+    characters and DEL.
 
     :param text: Text to inspect.
     :return: Distinct offending characters, in order of first appearance.
     """
     found = []
     for char in text:
-        if (char in INVALID_FILENAME_CHARS or ord(char) < 32) and char not in found:
+        if (char in INVALID_FILENAME_CHARS or ord(char) < 32 or ord(char) == 127) and char not in found:
             found.append(char)
     return found
 
@@ -473,10 +477,8 @@ def get_available_timezones() -> Set[str]:
     Return the IANA time zones known to the local time zone database.
 
     :return: Known zone names; empty when no database is available
-        (e.g. Windows without the ``tzdata`` package, or Python 3.8).
+        (e.g. Windows without the optional ``tzdata`` package).
     """
-    if zoneinfo is None:
-        return set()
     try:
         return set(zoneinfo.available_timezones())
     except Exception:  # pragma: no cover - defensive, depends on the platform
@@ -487,7 +489,7 @@ def has_timezone_database() -> bool:
     """
     Tell whether a time zone database is available.
 
-    Without one (Windows without the ``tzdata`` package, or Python 3.8), the
+    Without one (e.g. Windows without the optional ``tzdata`` package), the
     program runs in degraded mode: zones cannot be applied and local times are kept.
 
     :return: ``True`` when at least one IANA zone is known.
@@ -501,9 +503,7 @@ def describe_missing_timezone_database() -> str:
 
     :return: Human-readable explanation.
     """
-    if zoneinfo is None:
-        return "no time zone database available: Python 3.9+ is required"
-    return "no time zone database found (on Windows, install the 'tzdata' package, e.g. with 'uv sync')"
+    return "no time zone database found (on Windows, install the optional 'tzdata' package, e.g. with 'uv sync')"
 
 
 def validate_timezone(name: Any, available: Optional[Set[str]] = None) -> Optional[str]:
@@ -523,6 +523,35 @@ def validate_timezone(name: Any, available: Optional[Set[str]] = None) -> Option
     if known and name not in known:
         return "unknown time zone {!r} (expected an IANA name such as 'Europe/Paris')".format(name)
     return None
+
+
+def validate_label(label: Any) -> List[str]:
+    """
+    Validate a device label, inserted in file names by ``{DEVICE}``.
+
+    The label must be valid in file names on every common system (Windows,
+    macOS, Linux, Android): no forbidden character (see
+    ``find_invalid_filename_chars``), and no leading or trailing space or dot,
+    which some systems strip or refuse.
+
+    :param label: Label to check.
+    :return: Error messages; empty when the label is valid.
+    """
+    if not isinstance(label, str) or not label.strip():
+        return ["'label' must be a non-empty string"]
+    errors = []
+    invalid = find_invalid_filename_chars(label)
+    if invalid:
+        errors.append(
+            "'label' contains invalid file name characters: {}".format(
+                " ".join(repr(char) for char in invalid)
+            )
+        )
+    if label != label.strip():
+        errors.append("'label' must not start or end with a space")
+    if label.startswith(".") or label.endswith("."):
+        errors.append("'label' must not start or end with '.'")
+    return errors
 
 
 def validate_match(match: Any) -> List[str]:
@@ -565,17 +594,7 @@ def validate_device(device: Any, available_timezones: Optional[Set[str]] = None)
     if "id" in device and (not isinstance(device["id"], str) or not device["id"].strip()):
         errors.append("'id' must be a non-empty string")
     if "label" in device:
-        label = device["label"]
-        if not isinstance(label, str) or not label.strip():
-            errors.append("'label' must be a non-empty string")
-        else:
-            invalid = find_invalid_filename_chars(label)
-            if invalid:
-                errors.append(
-                    "'label' contains invalid file name characters: {}".format(
-                        " ".join(repr(char) for char in invalid)
-                    )
-                )
+        errors.extend(validate_label(device["label"]))
     if "match" in device:
         errors.extend(validate_match(device["match"]))
     if "offset" in device:
@@ -594,14 +613,20 @@ def validate_devices(data: Any, available_timezones: Optional[Set[str]] = None) 
     """
     Validate the content of ``conf/devices.json``, including duplicate ids.
 
-    Ids are compared case-insensitively.
+    Ids are compared case-insensitively. The time zone database is scanned at
+    most once, and only when a device has a time zone.
 
     :param data: Parsed JSON content.
-    :param available_timezones: Known IANA zone names, forwarded to ``validate_timezone``.
+    :param available_timezones: Known IANA zone names, forwarded to ``validate_timezone``;
+        looked up once with ``get_available_timezones`` when ``None``.
     :return: Error messages; empty when the content is valid.
     """
     if not isinstance(data, dict) or not isinstance(data.get("devices"), list):
         return ["the devices file must be a JSON object with a 'devices' list"]
+    if available_timezones is None and any(
+        isinstance(device, dict) and "timezone" in device for device in data["devices"]
+    ):
+        available_timezones = get_available_timezones()
     errors = []
     for key in sorted(set(data) - {"devices"}):
         errors.append("unknown top-level key '{}'".format(key))
@@ -650,22 +675,26 @@ def find_device(devices: List[Dict[str, Any]], device_id: str) -> Optional[Dict[
     return None
 
 
-def write_devices_file(path: Path, data: Dict[str, Any]) -> None:
+def write_devices_file(path: Path, data: Dict[str, Any], backup: bool = True) -> None:
     """
     Write ``conf/devices.json`` safely.
 
-    The current file is first copied to ``devices.json.bak``; the new content
-    is written to a temporary file in the same folder, then atomically moved
-    over the target so an interruption never leaves a truncated file.
+    The current file is first copied to ``devices.json.bak`` (when ``backup``
+    is set); the new content is written to a temporary file in the same folder,
+    then atomically moved over the target so an interruption never leaves a
+    truncated file.
 
     :param path: Path of the devices file.
     :param data: Content to write (``{"devices": [...]}``).
+    :param backup: Copy the current file to ``devices.json.bak`` first. Callers
+        writing several times in one run back up only before the first write,
+        so the backup keeps the file as it was before the run.
     :raises ConfigError: If ``data`` is not a valid devices document.
     """
     errors = validate_devices(data)
     if errors:
         raise ConfigError("refusing to write invalid devices:\n  - {}".format("\n  - ".join(errors)))
-    if path.exists():
+    if backup and path.exists():
         shutil.copy2(str(path), str(path.with_name(path.name + ".bak")))
     descriptor, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
@@ -1115,14 +1144,12 @@ def load_zone(name: str) -> Any:
     :return: The ``zoneinfo.ZoneInfo`` object.
     :raises ValueError: If no time zone database is available or the zone is unknown.
     """
-    if zoneinfo is None:
-        raise ValueError("time zone {!r} cannot be used: Python 3.9+ is required".format(name))
     try:
         return zoneinfo.ZoneInfo(name)
     except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
         raise ValueError(
             "time zone {!r} not found in the time zone database "
-            "(on Windows, install the 'tzdata' package)".format(name)
+            "(on Windows, install the optional 'tzdata' package)".format(name)
         )
 
 
@@ -1187,7 +1214,7 @@ def choose_zone(device: Mapping[str, Any], cli_tz: Optional[str]) -> Tuple[str, 
 
 
 def compute_effective_date(
-    date: datetime, device: Mapping[str, Any], cli_tz: Optional[str] = None
+    date: datetime, device: Mapping[str, Any], cli_tz: Optional[str] = None, use_zones: bool = True
 ) -> EffectiveDate:
     """
     Compute the date used in file names.
@@ -1202,28 +1229,35 @@ def compute_effective_date(
     :param date: Capture date read from the metadata (naive or aware).
     :param device: Device entry of the file (``offset`` and optional ``timezone``).
     :param cli_tz: Value of ``--tz``, if any.
+    :param use_zones: Apply ``--tz`` and device time zones. ``False`` in degraded
+        mode (no time zone database), where the caller warns once for the whole
+        run: local times are then kept without a warning per file.
     :return: Effective date: an aware UTC date, or a naive local date.
-    :raises ValueError: If the offset moves the date out of the supported range.
+    :raises ValueError: If the offset or the conversion to UTC moves the date
+        out of the supported range (years 1 to 9999).
     """
     corrected = apply_offset(date, device.get("offset", DEFAULT_OFFSET))
-    if corrected.tzinfo is not None:
-        return EffectiveDate(corrected.astimezone(timezone.utc), corrected.strftime("%z"),
-                             ZONE_SOURCE_METADATA, ())
-    zone_name, zone_source = choose_zone(device, cli_tz)
-    if not zone_name:
-        return EffectiveDate(corrected, "", "", ())
     try:
-        zone = load_zone(zone_name)
-    except ValueError as error:
-        return EffectiveDate(corrected, "", "", ("{}; local time kept".format(error),))
-    kind = classify_local_time(corrected, zone)
-    if kind != LOCAL_TIME_VALID:
-        reason = ("occurs twice (clocks set back)" if kind == LOCAL_TIME_AMBIGUOUS
-                  else "does not exist (clocks set forward)")
-        warning = "{} {} in {}: local time kept, not converted to UTC".format(
-            corrected.isoformat(sep=" "), reason, zone_name)
-        return EffectiveDate(corrected, "", "", (warning,))
-    return EffectiveDate(corrected.replace(tzinfo=zone).astimezone(timezone.utc), zone_name, zone_source, ())
+        if corrected.tzinfo is not None:
+            return EffectiveDate(corrected.astimezone(timezone.utc), corrected.strftime("%z"),
+                                 ZONE_SOURCE_METADATA, ())
+        zone_name, zone_source = choose_zone(device, cli_tz) if use_zones else ("", "")
+        if not zone_name:
+            return EffectiveDate(corrected, "", "", ())
+        try:
+            zone = load_zone(zone_name)
+        except ValueError as error:
+            return EffectiveDate(corrected, "", "", ("{}; local time kept".format(error),))
+        kind = classify_local_time(corrected, zone)
+        if kind != LOCAL_TIME_VALID:
+            reason = ("occurs twice (clocks set back)" if kind == LOCAL_TIME_AMBIGUOUS
+                      else "does not exist (clocks set forward)")
+            warning = "{} {} in {}: local time kept, not converted to UTC".format(
+                corrected.isoformat(sep=" "), reason, zone_name)
+            return EffectiveDate(corrected, "", "", (warning,))
+        return EffectiveDate(corrected.replace(tzinfo=zone).astimezone(timezone.utc), zone_name, zone_source, ())
+    except OverflowError:
+        raise ValueError("date {} out of range once converted to UTC".format(corrected.isoformat(sep=" ")))
 
 
 def format_effective_date(effective: EffectiveDate) -> str:
@@ -1449,7 +1483,7 @@ def describe_unknown_files(identity: DeviceIdentity, analyses: Iterable[FileAnal
     return lines
 
 
-def describe_device(device: Mapping[str, Any], show_serial: bool = True) -> str:
+def describe_device(device: Mapping[str, Any]) -> str:
     """
     Describe a device entry for the user: its id, completed by readable details.
 
@@ -1457,14 +1491,13 @@ def describe_device(device: Mapping[str, Any], show_serial: bool = True) -> str:
     the label and the ``match`` criteria (make, model) tell which camera it is.
 
     :param device: Device entry.
-    :param show_serial: Whether to show the masked serial number; disable it for text that reaches the log.
     :return: Text such as ``'hero9-black' (label 'HERO9 Black'; Make 'GoPro', Model 'HERO9 Black')``.
     """
     match = device.get("match") or {}
     identity = DeviceIdentity(
         clean_text(match.get("make")),
         clean_text(match.get("model")),
-        clean_text(match.get("serial_number")) if show_serial else "",
+        clean_text(match.get("serial_number")),
     )
     details = ["label '{}'".format(clean_text(device.get("label")))]
     if any(identity):
@@ -1476,7 +1509,7 @@ def format_unknown_forced_device_error(device_id: str, devices: Sequence[Mapping
     """
     Build the error shown when ``--device`` names an unknown id.
 
-    Serial numbers are left out because the message is also logged.
+    Serial numbers are masked, as everywhere else (see ``mask_serial``).
 
     :param device_id: Id given to ``--device``.
     :param devices: Known device entries.
@@ -1485,7 +1518,7 @@ def format_unknown_forced_device_error(device_id: str, devices: Sequence[Mapping
     lines = ["--device: unknown device id {!r}".format(device_id)]
     if devices:
         lines.append("Known devices:")
-        lines.extend("  - {}".format(describe_device(device, show_serial=False)) for device in devices)
+        lines.extend("  - {}".format(describe_device(device)) for device in devices)
     else:
         lines.append("No device is registered in conf/devices.json.")
     return "\n".join(lines)
@@ -1514,11 +1547,13 @@ def default_label(identity: DeviceIdentity) -> str:
     Suggest a device label from an identification.
 
     :param identity: Identification of the device.
-    :return: Model (or make) without invalid file name characters; ``"Device"`` as last resort.
+    :return: Model (or make) without invalid file name characters nor leading or
+        trailing spaces and dots, so that it passes ``validate_label``; ``"Device"`` as last resort.
     """
     text = identity.model or identity.make
     invalid = set(find_invalid_filename_chars(text))
-    return "".join(char for char in text if char not in invalid).strip() or "Device"
+    cleaned = "".join(char for char in text if char not in invalid)
+    return re.sub(r"^[\s.]+|[\s.]+$", "", cleaned) or "Device"
 
 
 def validate_label_answer(answer: str) -> Optional[str]:
@@ -1526,16 +1561,9 @@ def validate_label_answer(answer: str) -> Optional[str]:
     Validate a device label typed by the user.
 
     :param answer: Typed label.
-    :return: An error message, or ``None`` when the label is valid.
+    :return: An error message, or ``None`` when the label is valid (see ``validate_label``).
     """
-    if not answer:
-        return "the label must not be empty"
-    invalid = find_invalid_filename_chars(answer)
-    if invalid:
-        return "the label contains invalid file name characters: {}".format(
-            " ".join(repr(char) for char in invalid)
-        )
-    return None
+    return "; ".join(validate_label(answer)) or None
 
 
 def validate_offset_answer(answer: str) -> Optional[str]:
@@ -1673,7 +1701,9 @@ def resolve_unknown_devices(
     Register every unknown device before any file is modified.
 
     Each answer is saved to ``devices.json`` at once and reused for all the
-    matching files of the batch, so a device is asked for only once.
+    matching files of the batch, so a device is asked for only once. The file
+    is backed up before the first save only, so ``devices.json.bak`` keeps the
+    devices known before the run.
 
     :param analyses: File analyses, possibly with unknown devices.
     :param devices: Validated device entries.
@@ -1698,7 +1728,7 @@ def resolve_unknown_devices(
         except EOFError:
             raise UnknownDeviceError(format_unknown_devices_error(unknown))
         known.append(device)
-        write_devices_file(devices_path, {"devices": known})
+        write_devices_file(devices_path, {"devices": known}, backup=len(known) == len(devices) + 1)
         print("  Saved device {} to {}".format(describe_device(device), devices_path), file=out)
         current = [
             analysis._replace(status=STATUS_READY, device=device)
@@ -1710,21 +1740,24 @@ def resolve_unknown_devices(
     return current, known
 
 
-def add_effective_dates(analyses: Sequence[FileAnalysis], cli_tz: Optional[str] = None) -> List[FileAnalysis]:
+def add_effective_dates(
+    analyses: Sequence[FileAnalysis], cli_tz: Optional[str] = None, use_zones: bool = True
+) -> List[FileAnalysis]:
     """
     Compute the effective date of every ready file.
 
-    A file whose offset moves the date out of range is skipped.
+    A file whose offset or conversion to UTC moves the date out of range is skipped.
 
     :param analyses: File analyses, with every device resolved.
     :param cli_tz: Value of ``--tz``, if any.
+    :param use_zones: Apply ``--tz`` and device time zones (see ``compute_effective_date``).
     :return: Analyses with their ``effective`` field set for ready files.
     """
     result = []
     for analysis in analyses:
         if analysis.status == STATUS_READY and analysis.date is not None and analysis.device is not None:
             try:
-                effective = compute_effective_date(analysis.date, analysis.device, cli_tz)
+                effective = compute_effective_date(analysis.date, analysis.device, cli_tz, use_zones)
                 analysis = analysis._replace(effective=effective)
             except ValueError as error:
                 analysis = analysis._replace(status=STATUS_SKIPPED, message=str(error))
@@ -1745,12 +1778,15 @@ def analyze_source(
     input_func: Callable[[str], str] = input,
     out: Optional[TextIO] = None,
     cli_tz: Optional[str] = None,
+    use_zones: bool = True,
 ) -> List[FileAnalysis]:
     """
     Discover the files of a source folder, read their metadata, identify their devices
     and compute their effective dates.
 
-    Source files are only read. Unknown devices are resolved before returning.
+    Source files are only read. GoPro auxiliary files are not sent to
+    ExifTool: they take the date and device of their main video. Unknown
+    devices are resolved before returning.
 
     :param source: Source folder.
     :param extensions: Accepted extensions.
@@ -1764,6 +1800,7 @@ def analyze_source(
     :param input_func: Function reading one line, such as ``input``.
     :param out: Stream for messages; ``sys.stdout`` when ``None``.
     :param cli_tz: Value of ``--tz``, if any.
+    :param use_zones: Apply ``--tz`` and device time zones (see ``compute_effective_date``).
     :return: One analysis per discovered file, in discovery order.
     :raises NotADirectoryError: If ``source`` is not an existing folder.
     :raises ExifToolError: If ExifTool cannot be started.
@@ -1773,13 +1810,14 @@ def analyze_source(
     relatives = discover_files(source, extensions, recursive, excluded_dirs)
     root = source.resolve()
     absolute = [root / relative for relative in relatives]
-    metadata, errors = read_metadata(executable, absolute) if absolute else ({}, {})
+    to_read = [path for relative, path in zip(relatives, absolute) if not is_auxiliary_file(relative)]
+    metadata, errors = read_metadata(executable, to_read) if to_read else ({}, {})
     analyses = [
         analyze_file(relative, metadata.get(path), errors.get(path), devices, forced_device)
         for relative, path in zip(relatives, absolute)
     ]
     analyses, _ = resolve_unknown_devices(analyses, devices, devices_path, interactive, input_func, out)
-    return add_effective_dates(analyses, cli_tz)
+    return add_effective_dates(analyses, cli_tz, use_zones)
 
 
 def describe_date_source(analysis: FileAnalysis) -> str:
@@ -1866,8 +1904,8 @@ def sanitize_stem(stem: str) -> str:
     """
     Turn a rendered name (without extension) into a valid file name, deterministically.
 
-    The name is normalized to Unicode NFC; invalid file name characters and
-    control characters become ``_``; leading and trailing dots and spaces are
+    The name is normalized to Unicode NFC; invalid file name characters (see
+    ``find_invalid_filename_chars``) become ``_``; leading and trailing dots and spaces are
     removed; the name is cut to ``MAX_STEM_BYTES`` UTF-8 bytes (whole characters
     only); an empty result becomes ``_``; a Windows reserved device name
     (``CON``, ``NUL``, ``COM1``...) is prefixed with ``_``.
@@ -1876,7 +1914,8 @@ def sanitize_stem(stem: str) -> str:
     :return: Sanitized name.
     """
     cleaned = unicodedata.normalize("NFC", stem)
-    cleaned = "".join("_" if char in INVALID_FILENAME_CHARS or ord(char) < 32 else char for char in cleaned)
+    invalid = set(find_invalid_filename_chars(cleaned))
+    cleaned = "".join("_" if char in invalid else char for char in cleaned)
     cleaned = truncate_utf8(cleaned.strip(" ."), MAX_STEM_BYTES).strip(" .") or "_"
     if cleaned.split(".")[0].rstrip(" ").upper() in WINDOWS_RESERVED_NAMES:
         cleaned = "_" + cleaned
@@ -1938,12 +1977,16 @@ def build_target_stem(analysis: FileAnalysis, pattern: str) -> str:
 
 def folder_key(relative: Path) -> str:
     """
-    Build a case-insensitive key for the folder of a relative path.
+    Build the key of the folder of a relative path.
+
+    The key keeps the case: discovered paths are spelled as on disk, so one
+    folder always has one spelling, while ``A`` and ``a`` are two different
+    folders on case-sensitive file systems.
 
     :param relative: File path relative to the source folder.
-    :return: Case-folded POSIX path of the parent folder.
+    :return: POSIX path of the parent folder.
     """
-    return relative.parent.as_posix().casefold()
+    return relative.parent.as_posix()
 
 
 def gopro_file_id(stem: str) -> Optional[str]:
@@ -2040,7 +2083,7 @@ def group_auxiliaries(
             orphans[relative] = "no main video with the same base name in its folder; not renamed"
             continue
         if main.status != STATUS_READY:
-            orphans[relative] = "main video {} is skipped; not renamed".format(main.relative.name)
+            orphans[relative] = MAIN_SKIPPED_WARNING.format(main.relative.name)
             continue
         group = auxiliaries.setdefault(main.relative, [])
         used = {main.relative.suffix.casefold()} | {member.relative.suffix.casefold() for member in group}
@@ -2139,6 +2182,11 @@ def build_plan(
             base_stem = build_target_stem(analysis, pattern)
         except ValueError as error:
             entries[relative.as_posix()] = PlanEntry(relative, None, ACTION_SKIP, str(error), ())
+            # Its auxiliary files cannot take its name: skip them as well.
+            warning = MAIN_SKIPPED_WARNING.format(relative.name)
+            for member in auxiliaries.get(relative, []):
+                entries[member.relative.as_posix()] = PlanEntry(member.relative, None, ACTION_SKIP, warning,
+                                                                (warning,))
             continue
         group = [analysis] + auxiliaries.get(relative, [])
         key = folder_key(relative)
@@ -2158,8 +2206,12 @@ def build_plan(
                 # Compare strings: Windows paths compare equal regardless of case.
                 same = target.as_posix() == member.relative.as_posix()
                 action = ACTION_UNCHANGED if same else ACTION_RENAME
-            message = "" if member is analysis else "follows {}".format(relative.name)
-            entries[member.relative.as_posix()] = PlanEntry(member.relative, target, action, message, warnings)
+            if member is analysis:
+                entries[member.relative.as_posix()] = PlanEntry(member.relative, target, action, "", warnings)
+            else:
+                # The main video carries the date warnings, so they are counted once.
+                entries[member.relative.as_posix()] = PlanEntry(
+                    member.relative, target, action, "follows {}".format(relative.name), ())
     return tuple(entries[analysis.relative.as_posix()] for analysis in ordered)
 
 
@@ -2218,41 +2270,94 @@ def is_same_file(first: Path, second: Path) -> bool:
         return False
 
 
+def are_separate_names(source: Path, target: Path) -> bool:
+    """
+    Tell whether two paths of one existing file are two directory entries.
+
+    This is the case of hard links, and not of a case-only or Unicode
+    normalization variant of one name on a file system that ignores those
+    differences (the folder then lists a single spelling).
+
+    :param source: Existing path of the file.
+    :param target: Other existing path of the same file.
+    :return: ``True`` when both names exist side by side.
+    """
+    if source.parent != target.parent or name_key(source.name) != name_key(target.name):
+        return True
+    if source.name == target.name:
+        return False
+    try:
+        names = set(os.listdir(str(source.parent)))
+    except OSError:
+        return False
+    return source.name in names and target.name in names
+
+
+@contextmanager
+def deferred_signals() -> Iterator[None]:
+    """
+    Delay Ctrl+C (``SIGINT``) and ``SIGTERM`` until the end of a critical section.
+
+    A signal received meanwhile is delivered on exit, so the section is never
+    interrupted halfway. Without ``signal.pthread_sigmask`` (Windows), signals
+    are not delayed.
+
+    :return: Context manager; nothing is yielded.
+    """
+    if not hasattr(signal, "pthread_sigmask"):
+        yield
+        return
+    blocked = {signal.SIGINT, signal.SIGTERM}
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
 def safe_rename(source: Path, target: Path, use_hard_link: Optional[bool] = None) -> None:
     """
     Rename a file without ever overwriting an existing one.
 
     A target that is the source itself (case-only rename on a case-insensitive
-    file system) is allowed. On Windows, ``os.rename`` refuses existing targets.
-    Elsewhere, a hard link is created first (it fails if the target exists),
-    then the old name is removed; file systems without hard links (e.g. FAT or
-    exFAT memory cards) fall back to a checked ``os.rename``.
+    file system) is allowed. A target that is another name of the same file
+    (hard link, e.g. left by an interrupted run) already gives access to the
+    content: the old name is just removed. On Windows, ``os.rename`` refuses
+    existing targets. Elsewhere, a hard link is created first (it fails if the
+    target exists), then the old name is removed, with Ctrl+C delayed between
+    both steps so the file is not left under two names; file systems without
+    hard links (e.g. FAT or exFAT memory cards) fall back to a checked ``os.rename``.
 
     :param source: Existing file.
     :param target: New path, in an existing folder.
     :param use_hard_link: Use the hard link strategy; ``True`` everywhere but Windows when ``None``.
-    :raises FileExistsError: If the target already exists.
+    :raises FileExistsError: If the target already exists as another file.
     :raises OSError: If the file cannot be renamed.
     """
     link = os.name != "nt" if use_hard_link is None else use_hard_link
     if os.path.lexists(str(target)):
         if not is_same_file(source, target):
             raise FileExistsError(errno.EEXIST, "target already exists", str(target))
-        os.rename(str(source), str(target))
+        if are_separate_names(source, target):
+            # os.rename would do nothing: both names of one file are kept by POSIX.
+            os.unlink(str(source))
+        else:
+            os.rename(str(source), str(target))
         return
     if not link or os.path.islink(str(source)):
         os.rename(str(source), str(target))
         return
-    try:
-        os.link(str(source), str(target))
-    except FileExistsError:
-        raise
-    except OSError:
-        if os.path.lexists(str(target)):
-            raise FileExistsError(errno.EEXIST, "target already exists", str(target))
-        os.rename(str(source), str(target))
-        return
-    os.unlink(str(source))
+    with deferred_signals():
+        try:
+            os.link(str(source), str(target))
+        except FileExistsError:
+            raise
+        except OSError:
+            if os.path.lexists(str(target)):
+                raise FileExistsError(errno.EEXIST, "target already exists", str(target))
+            os.rename(str(source), str(target))
+            return
+        os.unlink(str(source))
 
 
 def safe_copy(source: Path, target: Path) -> None:
@@ -2261,7 +2366,9 @@ def safe_copy(source: Path, target: Path) -> None:
 
     Missing parent folders of the target are created; the target is created
     exclusively, its content then times and permissions are copied. A partial
-    copy is removed on failure.
+    copy is removed on failure. Times and permissions are copied when the file
+    system allows it: FAT or exFAT drives and some network shares refuse
+    permissions, which does not make the copy fail.
 
     :param source: Existing file.
     :param target: Path of the copy.
@@ -2282,7 +2389,11 @@ def safe_copy(source: Path, target: Path) -> None:
                 writer.close()
                 os.remove(str(target))
                 raise
-    shutil.copystat(str(source), str(target))
+    try:
+        # Times are copied first, so they are kept even when permissions are refused.
+        shutil.copystat(str(source), str(target))
+    except OSError:
+        pass
 
 
 def execute_plan(
@@ -2623,7 +2734,7 @@ def report_warning(logger: logging.Logger, message: str) -> None:
 
 def run_check(
     project_root: Path,
-    timezone: Optional[str] = None,
+    cli_tz: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
     out: Optional[TextIO] = None,
     err: Optional[TextIO] = None,
@@ -2634,7 +2745,7 @@ def run_check(
     Every check runs, so all problems are reported at once.
 
     :param project_root: Project folder containing ``conf/`` and ``bin/``.
-    :param timezone: Optional ``--tz`` value to validate.
+    :param cli_tz: Optional ``--tz`` value to validate.
     :param environ: Environment variables; ``os.environ`` when ``None``.
     :param out: Stream for success messages; ``sys.stdout`` when ``None``.
     :param err: Stream for error messages; ``sys.stderr`` when ``None``.
@@ -2662,15 +2773,15 @@ def run_check(
     else:
         print("[WARNING] Time zone database: {}; degraded mode, local times are kept".format(
             describe_missing_timezone_database()), file=out)
-    if timezone is not None:
-        tz_error, tz_warning = check_cli_timezone(timezone)
+    if cli_tz is not None:
+        tz_error, tz_warning = check_cli_timezone(cli_tz)
         if tz_error:
             print("[ERROR] --tz: {}".format(tz_error), file=err)
             failed = True
         elif tz_warning:
             print("[WARNING] --tz: {}".format(tz_warning), file=out)
         else:
-            print("[OK] Time zone: {}".format(timezone), file=out)
+            print("[OK] Time zone: {}".format(cli_tz), file=out)
     try:
         executable = find_exiftool(project_root / BIN_DIR_NAME, environ)
         version = get_exiftool_version(executable)
@@ -2724,6 +2835,8 @@ def run_batch(
     devices_path = root / CONF_DIR_NAME / DEVICES_FILE_NAME
     privacy = get_privacy_filter(logger) or PrivacyFilter()
     privacy.add_secrets(collect_secrets((), devices))
+    # Without a database, zones are announced as ignored once for the whole run, not per file.
+    zones_available = has_timezone_database()
     if args.tz is not None:
         tz_error, tz_warning = check_cli_timezone(args.tz)
         if tz_error:
@@ -2731,9 +2844,6 @@ def run_batch(
             return 1
         if tz_warning:
             report_warning(logger, "--tz: {}".format(tz_warning))
-    elif any(device.get("timezone") for device in devices) and not has_timezone_database():
-        report_warning(logger, "Device time zones ignored, local times kept: {}".format(
-            describe_missing_timezone_database()))
     forced_device = None
     if args.device is not None:
         forced_device = find_device(devices, args.device)
@@ -2754,12 +2864,19 @@ def run_batch(
         analyses = analyze_source(
             source, config["supported_extensions"], devices, devices_path, executable,
             args.recursive, forced_device, excluded, interactive, input_func, cli_tz=args.tz,
+            use_zones=zones_available,
         )
     except (ConfigError, ExifToolError, UnknownDeviceError) as error:
         report_error(logger, str(error))
         return 1
     # Devices registered during the run may hold serial numbers too.
     privacy.add_secrets(collect_secrets(analyses, load_devices_quietly(devices_path)))
+    # Checked after the analysis, so devices registered during the run count too.
+    if args.tz is None and not zones_available and any(
+        analysis.device is not None and analysis.device.get("timezone") for analysis in analyses
+    ):
+        report_warning(logger, "Device time zones ignored, local times kept: {}".format(
+            describe_missing_timezone_database()))
     print_analysis(analyses, sys.stdout)
     # The same plan is printed and executed, so preview and apply always agree.
     plan = build_plan(analyses, config["filename_pattern"], source, dest_root)

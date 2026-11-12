@@ -22,9 +22,9 @@ Python packages
 ---------------
 
 No third-party Python package is required by the program itself (standard
-library only). `uv sync` installs, from PyPI, development and runtime helpers
-that are not redistributed here and keep their own licenses:
+library only). `uv sync` installs, from PyPI, a development tool and an
+optional helper that are not redistributed here and keep their own licenses:
 
 - pytest (MIT license) and its dependencies, for the tests;
-- tzdata (Apache License 2.0), the IANA time zone database for systems without
-  one (Windows).
+- tzdata (Apache License 2.0), optional, the IANA time zone database for
+  Windows, which has none; without it only time zone features are disabled.

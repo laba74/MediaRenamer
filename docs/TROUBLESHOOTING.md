@@ -59,7 +59,7 @@ Devices are stored in `conf/devices.json` (see the README for the format). Back 
 | Problem | Fix |
 | --- | --- |
 | Wrong label in the names | Change `label`. Already renamed files keep their old names; run again to rename them (the pattern must still match). |
-| A typo was entered when the device was registered | Edit the entry, or restore `conf/devices.json.bak` (the version before the last registration). |
+| A typo was entered when the device was registered | Edit the entry, or restore `conf/devices.json.bak` (the version before the last run that registered devices). |
 | Files go to the wrong device | Entries are tried in file order and the first match wins: move the more specific entry (with `make` and `serial_number`) above the generic one. |
 | Two bodies of the same model need different labels or offsets | Add `serial_number` to each entry's `match`. Files without a serial number (many videos) only match entries whose `model`/`make` match, so keep a generic entry last for them. |
 | A device is asked again at every run | Its `Make`/`Model` in the files differ from `match`: compare them with [Inspect a file's tags](#inspect-a-files-tags). Comparisons ignore case and extra spaces, not other differences. |
@@ -104,7 +104,7 @@ Without a zone, names use the camera's wall-clock time, marked `local` in the pr
 | `... occurs twice (clocks set back) in Europe/Paris: local time kept` | The local time exists twice on the night clocks go back; it cannot be converted reliably. The file keeps its local time; rename it by hand if needed. |
 | `... does not exist (clocks set forward) ...` | Same, for the hour skipped when clocks go forward (usually a wrong camera clock). |
 | `time zone '...' not found in the time zone database` | Use a valid IANA name (`Europe/Paris`, `America/New_York`, `UTC`), not an abbreviation such as `CET`. |
-| `--check` warns that the time zone database is missing | On Windows, run `uv sync` to install `tzdata`. Without it, `--tz` and device zones are ignored (degraded mode). |
+| `--check` warns that the time zone database is missing | On Windows, run `uv sync` to install the optional `tzdata` package. Without it, `--tz` and device zones are ignored (degraded mode); everything else works. |
 | A trip across zones | A zone applies to the whole batch or device: run once per zone, each with its own `--tz`. |
 
 ## Collisions and `_01` suffixes
@@ -132,7 +132,7 @@ Files in different folders never collide with each other: each folder (or each d
 - invalid JSON (missing comma or quote, trailing comma): the message gives the line and column;
 - unknown token in `filename_pattern` (only `{YYYY}` `{MM}` `{DD}` `{HH}` `{MIN}` `{SEC}` `{DEVICE}` `{ORIGINAL}`), path separators or invalid characters;
 - an extension without a leading dot, or an unknown `log_level`;
-- an offset not in signed `HH:MM:SS` form (minutes and seconds `00`–`59`), a duplicate device `id`, a `match` without `make` or `model`, a label with invalid file name characters, an unknown field.
+- an offset not in signed `HH:MM:SS` form (minutes and seconds `00`–`59`), a duplicate device `id`, a `match` without `make` or `model`, a label with invalid file name characters or a leading/trailing space or dot, an unknown field.
 
 If a personal file is beyond repair, restore your backup or reset it from its template (see "Back up your personal files" in the README).
 
@@ -142,6 +142,7 @@ If a personal file is beyond repair, restore your backup or reset it from its te
 | --- | --- |
 | `no main video with the same base name in its folder; not renamed` | A GoPro `.LRV`/`.THM`/`.WAV` without its `.MP4`/`.MOV` in the same folder. Process the folder that holds both, or rename it by hand. |
 | `main video ... is skipped; not renamed` | The auxiliary file follows a video that has no valid date or device: fix the video first. |
+| `another .LRV file already follows ...; not renamed` | Two auxiliary files of the same type (e.g. `GH011892.LRV` and `GL011892.LRV`) match one video: only the first one, in name order, follows it. Rename the other by hand or remove the duplicate. |
 | `[WARNING] Log file disabled: cannot write ...` | `.logs/` is not writable; the run continues without a log. |
 | `N unknown device(s) and no interactive terminal to register them` | See [Fix a device entry](#fix-a-device-entry). |
-| `source folder not found` | Check `--source` (quote paths with spaces). |
+| `--source: folder not found: PATH` | Check `--source` (quote paths with spaces). |

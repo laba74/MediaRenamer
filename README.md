@@ -20,7 +20,7 @@ Contents: [Installation](#installation) · [Configuration](#configuration) · [B
 
 ### 1. Requirements
 
-- Python 3.8 or later (3.9+ for time zone support).
+- Python 3.12 or later.
 - [uv](https://docs.astral.sh/uv/getting-started/installation/), which manages the Python environment. Every command below goes through `uv`.
 - ExifTool (step 3).
 
@@ -32,7 +32,7 @@ cd MediaRenamer
 uv sync
 ```
 
-`uv sync` creates `.venv/` and installs the development tools (`pytest`) and the `tzdata` time zone database, needed on Windows. The program itself only uses the Python standard library.
+`uv sync` creates `.venv/` and installs the development tools (`pytest`) and, on Windows only, the optional `tzdata` time zone database. The program itself only uses the Python standard library and needs no package: without `tzdata`, only the time zone features are disabled (see [Time zone database](#effective-date-clock-offset-and-time-zone)).
 
 ### 3. Install ExifTool
 
@@ -94,7 +94,7 @@ The configuration lives in `conf/`:
 | `devices.default.json` | yes | Template of `devices.json` (empty list); never modified by the program. |
 | `config.json` | **no** | Your settings. Created from the template on the first run if missing. |
 | `devices.json` | **no** | Your cameras. Created from the template on the first run; rewritten each time a new device is registered. |
-| `devices.json.bak` | **no** | Copy of `devices.json` taken before each rewrite. |
+| `devices.json.bak` | **no** | Copy of `devices.json` taken before the first rewrite of a run. |
 
 An existing personal file is never overwritten by a template. `devices.json` is rewritten atomically (temporary file, then replace), after a `devices.json.bak` copy, so an interruption cannot corrupt it. Both files are validated at every start; any error stops the run before a file is touched.
 
@@ -118,7 +118,7 @@ An existing personal file is never overwritten by a template. `devices.json` is 
   | `{DEVICE}` | The device `label` |
   | `{ORIGINAL}` | The original file name, without extension |
 
-  Unknown tokens, path separators, characters invalid in file names (`< > : " / \ | ? *`), a leading `.` and a trailing `.` or space are rejected at startup. Labels are validated the same way. In the rendered name, invalid characters coming from `{ORIGINAL}` are replaced by `_`, the name is normalized to Unicode NFC, and it is cut to 200 UTF-8 bytes (whole characters only) so that, with the collision suffix and the extension, it stays within the 255-byte file name limit of common file systems.
+  Unknown tokens, path separators, characters invalid in file names (`< > : " / \ | ? *`), a leading `.` and a trailing `.` or space are rejected at startup. Device labels must be portable too: no character forbidden on Windows, macOS, Linux or Android memory cards (`< > : " / \ | ? *`, control characters, DEL), and no leading or trailing space or dot. In the rendered name, invalid characters coming from `{ORIGINAL}` are replaced by `_`, the name is normalized to Unicode NFC, and it is cut to 200 UTF-8 bytes (whole characters only) so that, with the collision suffix and the extension, it stays within the 255-byte file name limit of common file systems.
 - `supported_extensions` — extensions to process, each starting with a dot; compared case-insensitively. Other files are ignored.
 - `dry_run_by_default` — `true` (recommended): preview unless `--apply` is given. `false`: apply unless `--dry-run` is given.
 - `log_level` — `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, for `.logs/rename.log`.
@@ -171,7 +171,7 @@ Copy-Item conf\config.json, conf\devices.json -Destination $HOME\Backups\MediaRe
 
 **Restore.** Copy the saved files back into `conf/`, then run `uv run python media_renamer.py --check`.
 
-**Undo the last device change.** `conf/devices.json.bak` holds the previous version of `devices.json`: copy it over `devices.json`.
+**Undo the last device change.** `conf/devices.json.bak` holds `devices.json` as it was before the last run that registered devices (all the devices added by that run are undone): copy it over `devices.json`.
 
 **Reset.** Delete (or move away) `conf/config.json` and/or `conf/devices.json`; the next run recreates them from `conf/config.default.json` and `conf/devices.default.json`. Never edit the `*.default.json` templates for your own settings: they are versioned and shared.
 
@@ -245,7 +245,7 @@ Preview only: no file was changed. Use --apply to perform these operations.
 
 Preview and `--apply` use the same plan, so the names applied are exactly those previewed (as long as the folders do not change in between).
 
-Each run is appended to `.logs/rename.log` in the project folder, at the configured `log_level`. `.logs/` is git-ignored and is never scanned. Neither the console nor the log shows GPS data, and serial numbers are masked (only their last 4 characters are shown, as `***4391`, and they never reach the log).
+Each run is appended to `.logs/rename.log` in the project folder, at the configured `log_level`. `.logs/` is git-ignored and is never scanned. Neither the console nor the log shows GPS data. Serial numbers are always masked: only their last 4 characters are shown, as `***4391`, in the console and in the log; a full serial number never appears.
 
 ## How files are analyzed
 
@@ -280,7 +280,7 @@ The date used in file names (the *effective date*) is computed in two steps. The
 
 **Daylight saving time.** When a zone is applied, a local time that occurs twice (clocks set back, e.g. 02:30 on 27 October 2024 in `Europe/Paris`) or never (clocks set forward, e.g. 02:30 on 31 March 2024) cannot be converted reliably. Such files keep their local time and a warning is printed: nothing is converted silently.
 
-**Time zone database.** IANA zones need Python 3.9+ and a time zone database. Linux and macOS provide one; on Windows, the `tzdata` package is needed (installed by `uv sync`). Without it, the program runs in **degraded mode**: `--tz` and device zones are ignored with a warning and local times are kept (dates stored with an offset in the metadata are still converted to UTC). `--check` reports whether the database is available; its absence is a warning, not a failure. A syntactically invalid `--tz` is still rejected.
+**Time zone database.** IANA zones need a time zone database. Linux and macOS provide one; on Windows, the optional `tzdata` package is needed (installed by default by `uv sync`; skipped by `uv sync --no-group timezones`). Without it, the program runs in **degraded mode**: `--tz` and device zones are ignored with a warning and local times are kept (dates stored with an offset in the metadata are still converted to UTC). `--check` reports whether the database is available; its absence is a warning, not a failure. A syntactically invalid `--tz` is still rejected.
 
 ### Limits of zone-less metadata
 
@@ -318,4 +318,4 @@ uv run pytest
 
 MediaRenamer's original code and documentation are released under the [MIT license](LICENSE).
 
-ExifTool is a separate program by Phil Harvey, distributed under its own license (the same terms as Perl: Artistic License or GPL). It is **not** included in this repository and **not** covered by the MIT license; you install it yourself (see [Install ExifTool](#3-install-exiftool)). The `tzdata` and `pytest` packages installed by `uv sync` also keep their own licenses. See [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).
+ExifTool is a separate program by Phil Harvey, distributed under its own license (the same terms as Perl: Artistic License or GPL). It is **not** included in this repository and **not** covered by the MIT license; you install it yourself (see [Install ExifTool](#3-install-exiftool)). The optional `tzdata` and the development `pytest` packages installed by `uv sync` also keep their own licenses. See [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).

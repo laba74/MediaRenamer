@@ -3,15 +3,22 @@ name = "media-renamer"
 version = "0.1.0"
 description = "Configurable CLI that renames photos and videos from their metadata."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = []
 
 [dependency-groups]
 dev = [
     "pytest",
-    "tzdata>=2026.6",
 ]
+# Optional: IANA time zone database for Windows, which has none. Without it,
+# time zones are ignored (degraded mode). Installed by default by `uv sync`.
+timezones = [
+    "tzdata>=2026.6; sys_platform == 'win32'",
+]
+
+[tool.uv]
+default-groups = ["dev", "timezones"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

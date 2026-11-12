@@ -1,6 +1,6 @@
 # MediaRenamer — Backlog
 
-Epics and user stories derived from `docs/PLAN.MD`. Each epic ends with a **Done** section: the checks that must all pass before the epic is closed. All commands use `uv` (see `AGENTS.md`).
+Epics and user stories of the project. Each epic ends with a **Done** section: the checks that must all pass before the epic is closed. All commands use `uv` (see `AGENTS.md`).
 
 Global Definition of Done (applies to every story):
 
@@ -14,7 +14,7 @@ Global Definition of Done (applies to every story):
 
 Goal: load and validate `conf/config.json` / `conf/devices.json`, locate ExifTool, expose `--check` and `--help`.
 
-- **1.1 CLI skeleton** — As a user, I get `--help` and all options from the plan (`--source`, `--dest`, `--apply`, `--recursive`, `--device`, `--tz`, `--check`) parsed with `argparse`.
+- **1.1 CLI skeleton** — As a user, I get `--help` and all options (`--source`, `--dest`, `--apply`, `--dry-run`, `--recursive`, `--device`, `--tz`, `--check`) parsed with `argparse`.
 - **1.1b Default and personal config files** — As a user, my personal `conf/config.json` and `conf/devices.json` are never versioned and are created from `conf/config.default.json` / `conf/devices.default.json` on first run (message shown, existing files never overwritten). Writes to `devices.json` are atomic (temporary file + replace) and preceded by a `devices.json.bak` copy.
 - **1.2 Load `conf/config.json`** — Validate filename pattern, extensions, `dry_run_by_default`, `log_level`.
 - **1.3 Filename pattern validation** — Accept only known tokens (`{YYYY}`, `{MM}`, `{DD}`, `{HH}`, `{MIN}`, `{SEC}`, `{DEVICE}`, `{ORIGINAL}`); reject invalid characters and unexpected paths.
@@ -23,7 +23,7 @@ Goal: load and validate `conf/config.json` / `conf/devices.json`, locate ExifToo
 - **1.6 `--check`** — Validate configuration and print ExifTool version and location; non-zero exit on failure.
 
 ### Done — Epic 1
-- [x] `uv run python media_renamer.py --help` lists every option of the plan.
+- [x] `uv run python media_renamer.py --help` lists every option (`--source`, `--dest`, `--apply`, `--dry-run`, `--recursive`, `--device`, `--tz`, `--check`).
 - [x] `conf/config.json` and `conf/devices.json` are git-ignored; the `*.default.json` templates are tracked.
 - [x] On first run with missing personal files, they are created from the templates; existing files are left untouched (tested).
 - [x] `--check` succeeds with the default `conf/config.json`, empty `conf/devices.json` and ExifTool installed.
@@ -133,8 +133,8 @@ Goal: maintainable, English documentation.
 ### Done — Epic 7
 - [x] A new user can install and run a preview following only the README.
 - [x] The README tells the user to back up `conf/config.json` and `conf/devices.json`.
-- [x] Each troubleshooting topic of the plan is covered.
-- [x] Licensing statement consistent with the plan (MIT for original code, ExifTool under its own license).
+- [x] Each troubleshooting topic is covered: ExifTool check, tag inspection, device entry, offset, missing date, time zones, collisions.
+- [x] Licensing statement consistent (MIT for original code, ExifTool under its own license).
 
 ---
 
@@ -149,5 +149,5 @@ Goal: validate error cases and platforms.
 
 ### Done — Epic 8
 - [x] `uv run pytest` is green on Windows and one POSIX system (locally on Windows; in CI on Ubuntu, macOS and Windows via `.github/workflows/tests.yml`).
-- [x] Every function in `media_renamer.py` has at least one test (enforced by `test_every_function_has_a_test`).
+- [x] Every function in `media_renamer.py` has at least one test (enforced by `test_every_function_has_a_test`, which checks that tests reference it, and `test_every_function_is_executed_by_the_tests`, which checks with `sys.monitoring` that it actually runs).
 - [x] End-to-end run on a mixed sample (photos, videos, GoPro files, unknown device) validated manually.
