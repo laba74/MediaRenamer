@@ -13,9 +13,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10
 
       - name: Install ExifTool (Linux)
         if: runner.os == 'Linux'
@@ -25,6 +25,9 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install exiftool
 
-      # On Windows, ExifTool is not installed: the tests using a real ExifTool are skipped.
+      - name: Install ExifTool (Windows)
+        if: runner.os == 'Windows'
+        run: choco install exiftool --no-progress -y
+
       - name: Run tests
         run: uv run pytest -rs
