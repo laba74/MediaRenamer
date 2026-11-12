@@ -74,7 +74,8 @@ MediaRenamer/
 │   └── devices.json          # Appareils personnels (créé au 1er lancement; non versionné)
 ├── docs/
 │   ├── PLAN.MD            # Ce plan et les règles du projet
-│   └── BACKLOG.md         # Épopées et user stories
+│   ├── BACKLOG.md         # Épopées et user stories
+│   └── TROUBLESHOOTING.md # Guide de dépannage
 ├── tests/                 # Tests pytest (test_<module>.py par module)
 ├── README.md              # Présentation et guide de démarrage
 ├── AGENTS.md              # Règles de code (humains et agents IA)

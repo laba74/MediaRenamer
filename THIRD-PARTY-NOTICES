@@ -1,9 +1,30 @@
 Third-party notices
 ===================
 
-MediaRenamer's own code is released under the MIT license (see LICENSE).
+MediaRenamer's own code and documentation are released under the MIT license
+(see LICENSE). The MIT license covers only that original work; MediaRenamer
+together with the third-party software below is not "all MIT".
 
-ExifTool (https://exiftool.org) is an external program, installed manually in
-`bin/` (e.g. `bin/exiftool-13.62_64/`) and NOT redistributed in this repository. It remains under its own
-license (Perl Artistic License / GPL). If a binary is ever redistributed with
-MediaRenamer, add its notices and license text here or in `LICENSES/`.
+ExifTool
+--------
+
+ExifTool (https://exiftool.org), by Phil Harvey, is an external program run by
+MediaRenamer through a subprocess. It is installed manually by the user in
+`bin/` (e.g. `bin/exiftool-13.62_64/`), on the PATH or through EXIFTOOL_PATH,
+and is NOT redistributed in this repository (`bin/` is git-ignored). It remains
+under its own license: free software, redistributable and modifiable under the
+same terms as Perl itself (Perl Artistic License or GNU GPL).
+
+If an ExifTool binary is ever redistributed with MediaRenamer, add its notices
+and license text here or in `LICENSES/`.
+
+Python packages
+---------------
+
+No third-party Python package is required by the program itself (standard
+library only). `uv sync` installs, from PyPI, development and runtime helpers
+that are not redistributed here and keep their own licenses:
+
+- pytest (MIT license) and its dependencies, for the tests;
+- tzdata (Apache License 2.0), the IANA time zone database for systems without
+  one (Windows).

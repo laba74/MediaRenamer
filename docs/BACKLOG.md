@@ -131,10 +131,10 @@ Goal: maintainable, English documentation.
 - **7.3 Licensing** — Keep `LICENSE` (MIT) and `THIRD-PARTY-NOTICES` accurate.
 
 ### Done — Epic 7
-- [ ] A new user can install and run a preview following only the README.
-- [ ] The README tells the user to back up `conf/config.json` and `conf/devices.json`.
-- [ ] Each troubleshooting topic of the plan is covered.
-- [ ] Licensing statement consistent with the plan (MIT for original code, ExifTool under its own license).
+- [x] A new user can install and run a preview following only the README.
+- [x] The README tells the user to back up `conf/config.json` and `conf/devices.json`.
+- [x] Each troubleshooting topic of the plan is covered.
+- [x] Licensing statement consistent with the plan (MIT for original code, ExifTool under its own license).
 
 ---
 
