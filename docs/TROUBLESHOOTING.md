@@ -63,7 +63,7 @@ Devices are stored in `conf/devices.json` (see the README for the format). Back 
 | Files go to the wrong device | Entries are tried in file order and the first match wins: move the more specific entry (with `make` and `serial_number`) above the generic one. |
 | Two bodies of the same model need different labels or offsets | Add `serial_number` to each entry's `match`. Files without a serial number (many videos) only match entries whose `model`/`make` match, so keep a generic entry last for them. |
 | A device is asked again at every run | Its `Make`/`Model` in the files differ from `match`: compare them with [Inspect a file's tags](#inspect-a-files-tags). Comparisons ignore case and extra spaces, not other differences. |
-| `duplicate device id` | Each `id` must be unique; rename one of them. |
+| `duplicate id (already used by device #N)` | Each `id` must be unique (case-insensitive); rename one of them. |
 | Start over for a device | Delete its entry: the program asks again at the next run. |
 | Run without a terminal (script, scheduler) | Unknown devices cannot be asked: add them to `conf/devices.json` first, or use `--device ID`. |
 
