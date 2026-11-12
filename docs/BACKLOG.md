@@ -148,6 +148,6 @@ Goal: validate error cases and platforms.
 - **8.4 Coverage check** — Verify every function has a unit test.
 
 ### Done — Epic 8
-- [ ] `uv run pytest` is green on Windows and one POSIX system.
-- [ ] Every function in `media_renamer.py` has at least one test.
-- [ ] End-to-end run on a mixed sample (photos, videos, GoPro files, unknown device) validated manually.
+- [ ] `uv run pytest` is green on Windows and one POSIX system. *(Green on Windows; `.github/workflows/tests.yml` runs it on Ubuntu, macOS and Windows — pending its first run.)*
+- [x] Every function in `media_renamer.py` has at least one test (enforced by `test_every_function_has_a_test`).
+- [x] End-to-end run on a mixed sample (photos, videos, GoPro files, unknown device) validated manually.

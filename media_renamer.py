@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
@@ -125,6 +126,10 @@ WINDOWS_RESERVED_NAMES = frozenset(
     + ["LPT{}".format(index) for index in range(1, 10)]
 )
 COLLISION_SUFFIX_FORMAT = "_{:02d}"
+# Maximum size of a rendered name, in UTF-8 bytes, before the collision suffix
+# and the extension: file systems limit a name to 255 bytes (ext4, APFS) or
+# 255 UTF-16 units (NTFS, exFAT), which is never more restrictive than bytes.
+MAX_STEM_BYTES = 200
 
 RESULT_DONE = "done"
 RESULT_FAILED = "failed"
@@ -1827,19 +1832,52 @@ def print_analysis(analyses: Sequence[FileAnalysis], out: TextIO) -> None:
         len(analyses) - counts.get(STATUS_READY, 0) - counts.get(STATUS_AUXILIARY, 0), warnings), file=out)
 
 
+def truncate_utf8(text: str, max_bytes: int) -> str:
+    """
+    Cut a text so that its UTF-8 encoding fits in a number of bytes.
+
+    Only whole characters are kept, so the result is always valid text.
+
+    :param text: Text to cut.
+    :param max_bytes: Maximum size of the UTF-8 encoding, in bytes.
+    :return: The text itself when it fits, otherwise its longest fitting prefix.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def name_key(name: str) -> str:
+    """
+    Build the key used to compare file names, as case-insensitive file systems do.
+
+    Names are case-folded and normalized to Unicode NFC, so ``"Été.jpg"`` in
+    composed form and ``"été.JPG"`` in decomposed form (as macOS may list it)
+    are the same name.
+
+    :param name: File name.
+    :return: Comparison key.
+    """
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold())
+
+
 def sanitize_stem(stem: str) -> str:
     """
     Turn a rendered name (without extension) into a valid file name, deterministically.
 
-    Invalid file name characters and control characters become ``_``; leading
-    and trailing dots and spaces are removed; an empty result becomes ``_``; a
-    Windows reserved device name (``CON``, ``NUL``, ``COM1``...) is prefixed with ``_``.
+    The name is normalized to Unicode NFC; invalid file name characters and
+    control characters become ``_``; leading and trailing dots and spaces are
+    removed; the name is cut to ``MAX_STEM_BYTES`` UTF-8 bytes (whole characters
+    only); an empty result becomes ``_``; a Windows reserved device name
+    (``CON``, ``NUL``, ``COM1``...) is prefixed with ``_``.
 
     :param stem: Rendered name, without extension.
     :return: Sanitized name.
     """
-    cleaned = "".join("_" if char in INVALID_FILENAME_CHARS or ord(char) < 32 else char for char in stem)
-    cleaned = cleaned.strip(" .") or "_"
+    cleaned = unicodedata.normalize("NFC", stem)
+    cleaned = "".join("_" if char in INVALID_FILENAME_CHARS or ord(char) < 32 else char for char in cleaned)
+    cleaned = truncate_utf8(cleaned.strip(" ."), MAX_STEM_BYTES).strip(" .") or "_"
     if cleaned.split(".")[0].rstrip(" ").upper() in WINDOWS_RESERVED_NAMES:
         cleaned = "_" + cleaned
     return cleaned
@@ -2016,13 +2054,13 @@ def group_auxiliaries(
 
 def list_existing_names(folder: Path) -> Set[str]:
     """
-    List the case-folded names present in a folder (read only).
+    List the names present in a folder (read only), as comparison keys.
 
     :param folder: Folder to list.
-    :return: Case-folded entry names; empty when the folder does not exist.
+    :return: Entry names converted by ``name_key``; empty when the folder does not exist.
     """
     try:
-        return {name.casefold() for name in os.listdir(str(folder))}
+        return {name_key(name) for name in os.listdir(str(folder))}
     except OSError:
         return set()
 
@@ -2039,19 +2077,20 @@ def resolve_collision(
 
     ``base_stem`` is tried first, then ``base_stem_01``, ``base_stem_02``...
     until every ``stem + extension`` of the group is free. Names are compared
-    case-insensitively, so the result is valid on case-insensitive file systems.
+    with ``name_key`` (case and Unicode normalization ignored), so the result is
+    valid on case-insensitive and normalization-insensitive file systems.
 
     :param base_stem: Rendered name, without extension.
     :param extensions: Extensions of the group members, pairwise distinct (case-insensitively).
-    :param taken: Case-folded names already planned in the target folder.
-    :param existing: Case-folded names already present in the target folder.
-    :param own_names: Case-folded current names of the group members, which they may keep.
+    :param taken: Keys (``name_key``) of the names already planned in the target folder.
+    :param existing: Keys of the names already present in the target folder.
+    :param own_names: Keys of the current names of the group members, which they may keep.
     :return: Chosen name, without extension.
     """
     counter = 0
     while True:
         stem = base_stem if counter == 0 else base_stem + COLLISION_SUFFIX_FORMAT.format(counter)
-        names = [(stem + extension).casefold() for extension in extensions]
+        names = [name_key(stem + extension) for extension in extensions]
         if all(name not in taken and (name not in existing or name in own_names) for name in names):
             return stem
         counter += 1
@@ -2105,14 +2144,14 @@ def build_plan(
         key = folder_key(relative)
         if key not in existing:
             existing[key] = list_existing_names(target_root / relative.parent)
-        own_names = set() if dest_root is not None else {member.relative.name.casefold() for member in group}
+        own_names = set() if dest_root is not None else {name_key(member.relative.name) for member in group}
         folder_taken = taken.setdefault(key, set())
         stem = resolve_collision(base_stem, [member.relative.suffix for member in group], folder_taken,
                                  existing[key], own_names)
         warnings = analysis.effective.warnings if analysis.effective is not None else ()
         for member in group:
             target = relative.parent / (stem + member.relative.suffix)
-            folder_taken.add(target.name.casefold())
+            folder_taken.add(name_key(target.name))
             if dest_root is not None:
                 action = ACTION_COPY
             else:
@@ -2227,10 +2266,15 @@ def safe_copy(source: Path, target: Path) -> None:
     :param source: Existing file.
     :param target: Path of the copy.
     :raises FileExistsError: If the target already exists.
+    :raises NotADirectoryError: If a file stands where a parent folder of the target is needed.
     :raises OSError: If the file cannot be copied.
     """
     with open(str(source), "rb") as reader:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except FileExistsError:
+            # A file stands where a folder is needed: not a "target exists" case.
+            raise NotADirectoryError(errno.ENOTDIR, "a file stands where a folder is needed", str(target.parent))
         with open(str(target), "xb") as writer:
             try:
                 shutil.copyfileobj(reader, writer)

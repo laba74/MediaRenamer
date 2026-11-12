@@ -1,10 +1,12 @@
 """Unit tests for the ``media_renamer`` module."""
 
 import errno
+import inspect
 import io
 import json
 import logging
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -3373,3 +3375,442 @@ def test_logs_are_git_ignored() -> None:
     """
     ignored = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "/.logs/" in ignored
+
+
+
+# --- hardening: error cases (Epic 8.1) ------------------------------------------
+
+
+@pytest.fixture
+def corrupt_samples(tmp_path: Path, real_exiftool: Path) -> Path:
+    """
+    Create one valid photo and several corrupt or empty media files.
+
+    :param tmp_path: Pytest temporary folder.
+    :param real_exiftool: Path of a working ExifTool.
+    :return: Source folder.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    valid = source / "valid.jpg"
+    valid.write_bytes(MINIMAL_JPEG)
+    write_tags(real_exiftool, valid, {"Make": "GoPro", "Model": "HERO9 Black",
+                                      "DateTimeOriginal": "2024:01:02 03:04:05"})
+    (source / "empty.jpg").write_bytes(b"")
+    (source / "truncated.jpg").write_bytes(valid.read_bytes()[:20])
+    (source / "text.jpg").write_text("not a picture", encoding="utf-8")
+    (source / "garbage.mp4").write_bytes(bytes(range(256)) * 4)
+    (source / "broken.mp4").write_bytes(struct.pack(">I", 4096) + b"moov" + b"\x00" * 16)
+    (source / "garbage.dng").write_bytes(b"II*\x00" + b"\xff" * 64)
+    return source
+
+
+def test_corrupt_files_are_skipped_and_run_completes(corrupt_samples: Path, real_exiftool: Path,
+                                                     tmp_path: Path) -> None:
+    """
+    Check that corrupt, empty and truncated files are skipped with a reason, while the valid file is copied.
+    """
+    devices = [make_device(match={"make": "GoPro", "model": "HERO9 Black"}, offset="+00:00:00")]
+    devices_path = write_json(tmp_path / "devices.json", {"devices": devices})
+    before = snapshot(corrupt_samples)
+    analyses = mr.analyze_source(corrupt_samples, [".jpg", ".mp4", ".dng"], devices, devices_path,
+                                 real_exiftool, interactive=False)
+    by_name = {analysis.relative.as_posix(): analysis for analysis in analyses}
+    assert by_name.pop("valid.jpg").status == mr.STATUS_READY
+    assert len(by_name) == 6
+    for analysis in by_name.values():
+        assert analysis.status == mr.STATUS_SKIPPED and analysis.message, analysis
+    dest = tmp_path / "dest"
+    plan = mr.build_plan(analyses, PATTERN, corrupt_samples, dest)
+    results = mr.execute_plan(plan, corrupt_samples, dest)
+    assert mr.count_results(results)["copied"] == 1 and mr.count_results(results)["skipped"] == 6
+    assert sorted(path.name for path in dest.iterdir()) == ["2024-01-02_03-04-05_GoPro9.jpg"]
+    assert snapshot(corrupt_samples) == before
+
+
+@pytest.mark.parametrize(
+    "name, content, expected",
+    [
+        ("config.json", b"", "invalid JSON"),
+        ("config.json", b'{"filename_pattern": "\xe9t\xe9"}', "cannot be read"),
+        ("config.json", b"[]", "config.json"),
+        ("config.json", b'{"filename_pattern": 5}', "filename_pattern"),
+        ("devices.json", b"null", "devices.json"),
+        ("devices.json", b'{"devices": null}', "devices"),
+        ("devices.json", b'{"devices": [{"id": "x"}]}', "label"),
+        ("devices.json", b'{"devices": [{"id": "x", "label": "X", "match": {}, "offset": "1:00"}]}', "offset"),
+    ],
+)
+def test_main_check_rejects_invalid_configs(checked_project: Path, capsys: pytest.CaptureFixture,
+                                            name: str, content: bytes, expected: str) -> None:
+    """
+    Check that empty, badly encoded and ill-formed configuration files fail ``--check`` with a message.
+    """
+    (checked_project / "conf" / name).write_bytes(content)
+    assert mr.main(["--check"], project_root=checked_project) == 1
+    assert expected in capsys.readouterr().err
+
+
+def test_main_check_rejects_config_folder(checked_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that a folder standing in place of ``config.json`` is reported, not a crash.
+    """
+    config = checked_project / "conf" / "config.json"
+    config.unlink()
+    config.mkdir()
+    assert mr.main(["--check"], project_root=checked_project) == 1
+    assert "config.json" in capsys.readouterr().err
+
+
+def test_execute_plan_permission_denied(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that a permission error fails its entry only, with a readable message, and the run goes on.
+    """
+    make_tree(tmp_path, ["a.jpg", "b.jpg"])
+    plan = mr.build_plan([ready("a.jpg"), ready("b.jpg", when=WHEN + timedelta(seconds=1))], PATTERN, tmp_path)
+    real_rename = os.rename
+
+    def deny_a(source: str, target: str) -> None:
+        """
+        Refuse to rename ``a.jpg``, rename anything else.
+
+        :param source: Current path.
+        :param target: New path.
+        :raises PermissionError: For ``a.jpg``.
+        """
+        if Path(source).name == "a.jpg":
+            raise PermissionError(errno.EACCES, "Permission denied", source)
+        real_rename(source, target)
+
+    def no_link(source: str, target: str) -> None:
+        """
+        Simulate a file system without hard links.
+
+        :param source: Existing file.
+        :param target: Link to create.
+        :raises OSError: Always.
+        """
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(mr.os, "rename", deny_a)
+    monkeypatch.setattr(mr.os, "link", no_link)
+    results = mr.execute_plan(plan, tmp_path)
+    assert [result.status for result in results] == [mr.RESULT_FAILED, mr.RESULT_DONE]
+    assert results[0].message == "PermissionError: Permission denied"
+    assert (tmp_path / "a.jpg").is_file() and (tmp_path / "2024-01-02_03-04-06_GoPro9.jpg").is_file()
+
+
+def test_execute_plan_copy_unreadable_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that a source that cannot be opened fails its copy without creating any file.
+    """
+    source = tmp_path / "src"
+    make_tree(source, ["a.jpg"])
+    dest = tmp_path / "dest"
+    plan = mr.build_plan([ready("a.jpg")], PATTERN, source, dest)
+    real_open = open
+
+    def deny_read(path: str, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        """
+        Refuse to read files in binary mode, open anything else normally.
+
+        :param path: File to open.
+        :param mode: Opening mode.
+        :param args: Other positional arguments of ``open``.
+        :param kwargs: Keyword arguments of ``open``.
+        :return: Open file object.
+        :raises PermissionError: When reading in binary mode.
+        """
+        if mode == "rb":
+            raise PermissionError(errno.EACCES, "Permission denied", path)
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", deny_read)
+    results = mr.execute_plan(plan, source, dest)
+    assert results[0].status == mr.RESULT_FAILED and "PermissionError" in results[0].message
+    assert not dest.exists()
+
+
+def test_execute_plan_copy_file_in_place_of_folder(tmp_path: Path) -> None:
+    """
+    Check that a file standing where a destination folder is needed is not reported as an existing target.
+    """
+    source = tmp_path / "src"
+    make_tree(source, ["sub/a.jpg"])
+    dest = tmp_path / "dest"
+    make_tree(dest, ["sub"])
+    plan = mr.build_plan([ready("sub/a.jpg")], PATTERN, source, dest)
+    results = mr.execute_plan(plan, source, dest)
+    assert results[0].status == mr.RESULT_FAILED
+    assert results[0].message == "NotADirectoryError: a file stands where a folder is needed"
+    assert (dest / "sub").is_file()
+
+
+def test_safe_copy_file_in_place_of_folder(tmp_path: Path) -> None:
+    """
+    Check that ``safe_copy`` raises ``NotADirectoryError`` when the target folder is a file.
+    """
+    make_tree(tmp_path, ["a.jpg", "sub"])
+    with pytest.raises(NotADirectoryError):
+        mr.safe_copy(tmp_path / "a.jpg", tmp_path / "sub" / "b.jpg")
+
+
+@pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="POSIX folder permissions, not enforced for root")
+def test_execute_plan_read_only_folder_posix(tmp_path: Path) -> None:
+    """
+    Check a real permission error: files of a read-only folder cannot be renamed and stay intact.
+    """
+    make_tree(tmp_path, ["locked/a.jpg"])
+    plan = mr.build_plan([ready("locked/a.jpg")], PATTERN, tmp_path)
+    os.chmod(str(tmp_path / "locked"), 0o555)
+    try:
+        results = mr.execute_plan(plan, tmp_path)
+    finally:
+        os.chmod(str(tmp_path / "locked"), 0o755)
+    assert results[0].status == mr.RESULT_FAILED and "PermissionError" in results[0].message
+    assert sorted(path.name for path in (tmp_path / "locked").iterdir()) == ["a.jpg"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows locks files opened by another program")
+def test_execute_plan_locked_file_windows(tmp_path: Path) -> None:
+    """
+    Check a real permission error: a file opened by another program cannot be renamed.
+    """
+    make_tree(tmp_path, ["a.jpg"])
+    plan = mr.build_plan([ready("a.jpg")], PATTERN, tmp_path)
+    with open(str(tmp_path / "a.jpg"), "rb"):
+        results = mr.execute_plan(plan, tmp_path)
+    assert results[0].status == mr.RESULT_FAILED and "PermissionError" in results[0].message
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["a.jpg"]
+
+
+# --- hardening: date formats (Epic 8.2) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("2024:07:14 17:19:24.123+02:00", datetime(2024, 7, 14, 17, 19, 24, tzinfo=timezone(timedelta(hours=2)))),
+        ("2024:07:14 17:19:24.5Z", datetime(2024, 7, 14, 17, 19, 24, tzinfo=timezone.utc)),
+        ("2024:07:14 17:19:24.123456789", datetime(2024, 7, 14, 17, 19, 24)),
+        ("2024:07:14 17:19:24 +02:00", datetime(2024, 7, 14, 17, 19, 24, tzinfo=timezone(timedelta(hours=2)))),
+        ("2024-07-14 17:19:24", datetime(2024, 7, 14, 17, 19, 24)),
+        ("  2024:07:14 17:19:24  ", datetime(2024, 7, 14, 17, 19, 24)),
+        ("2024:07:14 17:19:24-00:00", datetime(2024, 7, 14, 17, 19, 24, tzinfo=timezone.utc)),
+        ("2024:12:31 23:59:59+14:00", datetime(2024, 12, 31, 23, 59, 59, tzinfo=timezone(timedelta(hours=14)))),
+        ("2024:07:14", None),
+        ("2024", None),
+        ("2024:07:14 17", None),
+        ("2024:13:01 00:00:00", None),
+        ("2024:07:14 24:00:00", None),
+        ("2024:07:14 17:19:60", None),
+        ("2024:07:14 17:19:24+25:00", None),
+        ("2024:07:14 17:19:24 DST", None),
+        ("24:07:14 17:19:24", None),
+        ("2024:07:14 17:19:24.", None),
+    ],
+)
+def test_parse_exif_datetime_variants(value: str, expected: Optional[datetime]) -> None:
+    """
+    Check more EXIF and QuickTime date variants: sub-seconds, zones, separators, partial and impossible values.
+    """
+    assert mr.parse_exif_datetime(value) == expected
+
+
+@pytest.mark.parametrize(
+    "metadata, expected",
+    [
+        ({"DateTimeOriginal": "0000:00:00 00:00:00", "MediaCreateDate": "2024:01:02 03:04:05"},
+         ("MediaCreateDate", datetime(2024, 1, 2, 3, 4, 5))),
+        ({"CreateDate": "2024:01:02 03:04:05", "OffsetTimeDigitized": "-0530"},
+         ("CreateDate", datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone(-timedelta(hours=5, minutes=30))))),
+        ({"DateTimeOriginal": "2024:01:02 03:04:05.250", "OffsetTimeOriginal": "garbage"},
+         ("DateTimeOriginal", datetime(2024, 1, 2, 3, 4, 5))),
+        ({"DateTimeOriginal": "2024:01:02 03:04:05+01:00", "OffsetTimeOriginal": "+05:00"},
+         ("DateTimeOriginal", datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone(timedelta(hours=1))))),
+        ({"TrackCreateDate": "2024:01:02 03:04"}, ("TrackCreateDate", datetime(2024, 1, 2, 3, 4))),
+        ({"MediaCreateDate": "0000:00:00 00:00:00", "TrackCreateDate": "0000:00:00 00:00:00"}, None),
+    ],
+)
+def test_select_capture_date_variants(metadata: Dict[str, str], expected: Any) -> None:
+    """
+    Check date selection with zero QuickTime dates, offset tags, sub-seconds and missing seconds.
+    """
+    assert mr.select_capture_date(metadata) == expected
+
+
+def test_real_date_variants(tmp_path: Path, real_exiftool: Path) -> None:
+    """
+    Check dates written by ExifTool: offset and sub-seconds in a JPG, zero date in an MP4.
+    """
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(MINIMAL_JPEG)
+    write_tags(real_exiftool, photo, {"DateTimeOriginal": "2024:07:14 17:19:24", "SubSecTimeOriginal": "123",
+                                      "OffsetTimeOriginal": "+02:00"})
+    video = tmp_path / "zero.mp4"
+    make_mp4(video, datetime(1904, 1, 1))
+    metadata, errors = mr.read_metadata(real_exiftool, [photo, video])
+    assert not errors
+    assert mr.select_capture_date(metadata[photo]) == (
+        "DateTimeOriginal", datetime(2024, 7, 14, 17, 19, 24, tzinfo=timezone(timedelta(hours=2))))
+    assert mr.select_capture_date(metadata[video]) is None
+
+
+# --- hardening: file systems (Epic 8.3) -----------------------------------------
+
+
+def test_truncate_utf8() -> None:
+    """
+    Check that texts are cut on whole characters to fit a UTF-8 size.
+    """
+    assert mr.truncate_utf8("abc", 3) == "abc"
+    assert mr.truncate_utf8("abcd", 3) == "abc"
+    assert mr.truncate_utf8("aé", 2) == "a"
+    assert mr.truncate_utf8("a\U0001f4f7b", 4) == "a"
+    assert mr.truncate_utf8("a\U0001f4f7b", 5) == "a\U0001f4f7"
+    assert mr.truncate_utf8("", 0) == ""
+
+
+def test_name_key() -> None:
+    """
+    Check that name keys ignore case and Unicode normalization.
+    """
+    composed = "Été.JPG"
+    decomposed = "Été.jpg"
+    assert mr.name_key(composed) == mr.name_key(decomposed) == "été.jpg"
+    assert mr.name_key("Straße.jpg") == mr.name_key("STRASSE.JPG")
+    assert mr.name_key("a.jpg") != mr.name_key("b.jpg")
+
+
+def test_sanitize_stem_long_and_unicode_names() -> None:
+    """
+    Check that long names are cut deterministically and that names are normalized to NFC.
+    """
+    long_name = mr.sanitize_stem("é" * 300)
+    assert long_name == "é" * (mr.MAX_STEM_BYTES // 2)
+    assert mr.sanitize_stem("a" * (mr.MAX_STEM_BYTES - 2) + " .xyz") == "a" * (mr.MAX_STEM_BYTES - 2)
+    assert mr.sanitize_stem("\U0001f4f7" * 100) == "\U0001f4f7" * (mr.MAX_STEM_BYTES // 4)
+    assert mr.sanitize_stem("Été") == "Été"
+
+
+def test_build_plan_collision_ignores_unicode_normalization(tmp_path: Path) -> None:
+    """
+    Check that an existing name written in decomposed Unicode is seen as taken by a composed target.
+    """
+    make_tree(tmp_path, ["a.jpg", "Été_GoPro9.jpg"])
+    plan = mr.build_plan([ready("a.jpg")], "Été_{DEVICE}", tmp_path)
+    assert targets(plan) == {"a.jpg": "Été_GoPro9_01.jpg"}
+
+
+def test_apply_long_names(tmp_path: Path) -> None:
+    """
+    Check a real rename of files whose rendered names would exceed the file system limits.
+    """
+    originals = ["é" * 120 + ".jpg", "é" * 119 + "x.jpg"]
+    make_tree(tmp_path, originals)
+    plan = mr.build_plan([ready(name) for name in originals], "{YYYY}_{DEVICE}_{ORIGINAL}", tmp_path)
+    results = mr.execute_plan(plan, tmp_path)
+    assert [result.status for result in results] == [mr.RESULT_DONE, mr.RESULT_DONE]
+    names = sorted(path.name for path in tmp_path.iterdir())
+    assert len(names) == 2 and names[1] == names[0][:-len(".jpg")] + "_01.jpg"
+    assert all(len(name.encode("utf-8")) <= 255 for name in names)
+    assert all(name.startswith("2024_GoPro9_ééé") for name in names)
+
+
+@pytest.mark.parametrize("copy", [False, True])
+def test_apply_special_characters(tmp_path: Path, copy: bool) -> None:
+    """
+    Check real renames and copies of names with spaces, accents, emoji, punctuation and a non-ASCII folder.
+    """
+    source = tmp_path / "src"
+    folder = "été 2024/"
+    originals = [folder + "photo d'été #1 (copie) [x] & 100%.jpg",
+                 folder + "Ünïcödé \U0001f4f7.JPG",
+                 folder + "semi;colon,comma=equal+plus.jpg"]
+    make_tree(source, originals)
+    label = "Caméra \U0001f4f7"
+    analyses = [ready(name, when=WHEN + timedelta(seconds=index), label=label)
+                for index, name in enumerate(originals)]
+    dest = tmp_path / "dest" if copy else None
+    plan = mr.build_plan(analyses, "{DEVICE} {ORIGINAL}", source, dest)
+    results = mr.execute_plan(plan, source, dest)
+    assert all(result.status == mr.RESULT_DONE for result in results)
+    root = dest if copy else source
+    found = sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file())
+    assert found == sorted(folder + label + " " + Path(name).name for name in originals)
+
+
+def test_apply_invalid_characters_from_original(tmp_path: Path) -> None:
+    """
+    Check that characters invalid on some systems, taken from ``{ORIGINAL}``, never reach the file system.
+    """
+    stem = mr.render_stem("{DEVICE}_{ORIGINAL}", WHEN, "GoPro9", 'x<y>z:"w|v?u*\x01')
+    assert stem == "GoPro9_x_y_z__w_v_u__"
+    make_tree(tmp_path, ["a.jpg"])
+    plan = mr.build_plan([ready("a.jpg")], stem, tmp_path)
+    assert mr.execute_plan(plan, tmp_path)[0].status == mr.RESULT_DONE
+    assert sorted(path.name for path in tmp_path.iterdir()) == [stem + ".jpg"]
+
+
+# --- coverage (Epic 8.4) ----------------------------------------------------------
+
+
+def list_module_functions() -> Dict[str, Any]:
+    """
+    List the functions and methods defined in ``media_renamer``.
+
+    :return: Mapping of qualified name (``function`` or ``Class.method``) to function.
+    """
+    module_file = os.path.normcase(str(Path(mr.__file__).resolve()))
+
+    def is_own(function: Any) -> bool:
+        """
+        Tell whether a function is written in ``media_renamer.py`` (not generated, not imported).
+
+        :param function: Function to check.
+        :return: ``True`` when its code comes from the module file.
+        """
+        return os.path.normcase(str(Path(function.__code__.co_filename).resolve())) == module_file
+
+    found = {}  # type: Dict[str, Any]
+    for name, member in vars(mr).items():
+        if inspect.isfunction(member) and is_own(member):
+            found[name] = member
+        elif inspect.isclass(member) and member.__module__ == mr.__name__:
+            for method_name, method in vars(member).items():
+                if inspect.isfunction(method) and is_own(method):
+                    found["{}.{}".format(name, method_name)] = method
+    return found
+
+
+def test_list_module_functions() -> None:
+    """
+    Check that module functions and class methods are listed, but not imported names.
+    """
+    functions = list_module_functions()
+    assert functions["main"] is mr.main
+    assert functions["PrivacyFilter.filter"] is mr.PrivacyFilter.filter
+    assert "datetime" not in functions and "DeviceIdentity.__repr__" not in functions
+
+
+def test_every_function_has_a_test() -> None:
+    """
+    Check that every function and method of ``media_renamer`` is used by at least one test.
+
+    A function counts as tested when the tests call it or pass it (``key=mr.natural_sort_key``);
+    a constructor counts when its class is instantiated; nested helpers are tested through their parent.
+    """
+    source = Path(__file__).read_text(encoding="utf-8")
+    missing = []
+    for qualified in list_module_functions():
+        owner, _, name = qualified.rpartition(".")
+        if name == "__init__":
+            pattern = r"\bmr\.{}\(".format(owner)
+        elif owner:
+            pattern = r"\.{}\(".format(name)
+        else:
+            pattern = r"\bmr\.{}\b".format(name)
+        if not re.search(pattern, source):
+            missing.append(qualified)
+    assert missing == []

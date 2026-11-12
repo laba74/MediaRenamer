@@ -118,7 +118,7 @@ An existing personal file is never overwritten by a template. `devices.json` is 
   | `{DEVICE}` | The device `label` |
   | `{ORIGINAL}` | The original file name, without extension |
 
-  Unknown tokens, path separators, characters invalid in file names (`< > : " / \ | ? *`), a leading `.` and a trailing `.` or space are rejected at startup. Labels are validated the same way. In the rendered name, invalid characters coming from `{ORIGINAL}` are replaced by `_`.
+  Unknown tokens, path separators, characters invalid in file names (`< > : " / \ | ? *`), a leading `.` and a trailing `.` or space are rejected at startup. Labels are validated the same way. In the rendered name, invalid characters coming from `{ORIGINAL}` are replaced by `_`, the name is normalized to Unicode NFC, and it is cut to 200 UTF-8 bytes (whole characters only) so that, with the collision suffix and the extension, it stays within the 255-byte file name limit of common file systems.
 - `supported_extensions` — extensions to process, each starting with a dot; compared case-insensitively. Other files are ignored.
 - `dry_run_by_default` — `true` (recommended): preview unless `--apply` is given. `false`: apply unless `--dry-run` is given.
 - `log_level` — `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, for `.logs/rename.log`.
@@ -220,7 +220,7 @@ On Windows, quote paths containing spaces: `--source "D:\My Photos\2025"`.
 - **Copy** (`--dest`): the file is copied under its new name; with `--recursive`, into the same relative subfolder under the destination. Only folders that receive at least one file are created (no empty folders). A destination inside the source is not scanned.
 - **Unchanged**: the file already has its target name.
 - **Skipped**: no valid date, no device, orphan GoPro auxiliary file… The reason is printed.
-- **Collisions**: when two files would get the same name in the same folder, or the name is already taken there, `_01`, `_02`… is added before the extension. Names are compared case-insensitively, so the result is safe on Windows and macOS.
+- **Collisions**: when two files would get the same name in the same folder, or the name is already taken there, `_01`, `_02`… is added before the extension. Names are compared case-insensitively and regardless of Unicode normalization (`é` composed or decomposed), so the result is safe on Windows and macOS.
 - **No overwrite**: an existing file is never replaced; if a target appears between the plan and the operation, the file is reported as an error and left alone.
 
 ### GoPro auxiliary files

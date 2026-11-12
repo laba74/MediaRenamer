@@ -109,7 +109,7 @@ Without a zone, names use the camera's wall-clock time, marked `local` in the pr
 
 ## Collisions and `_01` suffixes
 
-`_01`, `_02`… is added before the extension when the target name is already planned for another file, or already exists, **in the same target folder** (names compared case-insensitively).
+`_01`, `_02`… is added before the extension when the target name is already planned for another file, or already exists, **in the same target folder** (names compared case-insensitively and regardless of Unicode normalization).
 
 | Symptom | Explanation / fix |
 | --- | --- |
@@ -117,6 +117,9 @@ Without a zone, names use the camera's wall-clock time, marked `local` in the pr
 | Photos from two cameras collide | Add `{DEVICE}` to the pattern (it is in the default one). |
 | A second run adds `_01` to files already renamed | Not expected: a file whose name is already its target is `unchanged`. Check that the device label, offset, zone and pattern did not change between runs. |
 | Files with only a case difference (`a.JPG` / `A.jpg`) get suffixes | They would overwrite each other on Windows and macOS, so they are kept apart on every system. |
+| Two long names get `_01` although their originals differ | Rendered names are cut to 200 UTF-8 bytes; when `{ORIGINAL}` is long, the end that differs may be cut. Shorten the pattern or the original names. |
+| `NotADirectoryError: a file stands where a folder is needed` | With `--dest`, a file in the destination has the name of a subfolder to create. Rename or move that file. |
+| `PermissionError: ...` | The file is open in another program (Windows) or its folder is read-only. Only that file fails; close the program or fix the permissions and run again. |
 | `target already exists, not overwritten` | A file appeared at the target after the plan was built (another program, or two runs at once). Nothing was overwritten; run again. |
 | GoPro `.LRV`/`.THM` get a different suffix than their video | They never do: a main video and its auxiliary files always share one name. If they do not, they were not paired — see below. |
 
