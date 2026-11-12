@@ -94,13 +94,13 @@ Goal: execute the plan safely.
 - **5.2 In-place rename** — With `--apply` and no `--dest`, rename sources; each file stays in its own subfolder.
 - **5.3 Copy to destination** — With `--dest`, copy under the computed name and leave sources intact; create the destination if needed. With `--recursive`, recreate the original relative tree under the destination, creating only directories that receive at least one file (no empty directories, also in preview).
 - **5.4 Overwrite protection** — Never overwrite an existing file; fail or skip with a clear message.
-- **5.5 Config default** — Honor `dry_run_by_default` from `conf/config.json`.
+- **5.5 Config default** — Honor `dry_run_by_default` from `conf/config.json`; `--apply` forces execution and `--dry-run` forces a preview (mutually exclusive).
 
 ### Done — Epic 5
-- [ ] Preview and apply produce identical target names (same plan function).
-- [ ] Integration test with `tmp_path`: in-place rename, copy with sources intact, no overwrite.
-- [ ] Integration test with `tmp_path` and `--recursive`: in-place rename keeps subfolders; copy to `--dest` recreates the source tree and creates no empty directory (including subfolders with no supported file).
-- [ ] Unknown devices are resolved before the first file operation.
+- [x] Preview and apply produce identical target names (same plan function).
+- [x] Integration test with `tmp_path`: in-place rename, copy with sources intact, no overwrite.
+- [x] Integration test with `tmp_path` and `--recursive`: in-place rename keeps subfolders; copy to `--dest` recreates the source tree and creates no empty directory (including subfolders with no supported file).
+- [x] Unknown devices are resolved before the first file operation.
 - [ ] Manual run on a real sample folder gives the expected result.
 
 ---

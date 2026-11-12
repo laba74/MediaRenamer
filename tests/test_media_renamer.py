@@ -1,5 +1,6 @@
 """Unit tests for the ``media_renamer`` module."""
 
+import errno
 import io
 import json
 import os
@@ -2099,6 +2100,209 @@ def test_print_plan() -> None:
     ]
 
 
+# --- plan execution -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "apply_flag, dry_run_flag, dry_run_by_default, expected",
+    [
+        (False, False, True, False),
+        (False, False, False, True),
+        (True, False, True, True),
+        (False, True, False, False),
+        (True, True, False, False),
+    ],
+)
+def test_should_apply(apply_flag: bool, dry_run_flag: bool, dry_run_by_default: bool, expected: bool) -> None:
+    """
+    Check that ``--dry-run`` and ``--apply`` win over ``dry_run_by_default``.
+    """
+    assert mr.should_apply(apply_flag, dry_run_flag, dry_run_by_default) is expected
+
+
+def test_build_arg_parser_apply_and_dry_run_are_exclusive() -> None:
+    """
+    Check that ``--apply`` and ``--dry-run`` cannot be combined.
+    """
+    assert mr.build_arg_parser().parse_args(["--dry-run"]).dry_run
+    with pytest.raises(SystemExit):
+        mr.build_arg_parser().parse_args(["--apply", "--dry-run"])
+
+
+def test_is_same_file(tmp_path: Path) -> None:
+    """
+    Check the detection of a single file under two paths.
+    """
+    first = tmp_path / "a.jpg"
+    first.write_bytes(b"a")
+    (tmp_path / "b.jpg").write_bytes(b"a")
+    assert mr.is_same_file(first, tmp_path / "a.jpg")
+    assert not mr.is_same_file(first, tmp_path / "b.jpg")
+    assert not mr.is_same_file(first, tmp_path / "missing.jpg")
+
+
+@pytest.mark.parametrize("use_hard_link", [False, True])
+def test_safe_rename(tmp_path: Path, use_hard_link: bool) -> None:
+    """
+    Check a rename with both strategies, and that an existing target is never overwritten.
+    """
+    source = tmp_path / "a.jpg"
+    source.write_bytes(b"a")
+    mr.safe_rename(source, tmp_path / "b.jpg", use_hard_link)
+    assert not source.exists() and (tmp_path / "b.jpg").read_bytes() == b"a"
+    (tmp_path / "c.jpg").write_bytes(b"c")
+    with pytest.raises(FileExistsError):
+        mr.safe_rename(tmp_path / "b.jpg", tmp_path / "c.jpg", use_hard_link)
+    assert (tmp_path / "b.jpg").read_bytes() == b"a" and (tmp_path / "c.jpg").read_bytes() == b"c"
+
+
+def test_safe_rename_case_only(tmp_path: Path) -> None:
+    """
+    Check that a case-only rename works, also on case-insensitive file systems.
+    """
+    (tmp_path / "A.JPG").write_bytes(b"a")
+    mr.safe_rename(tmp_path / "A.JPG", tmp_path / "a.jpg", True)
+    assert os.listdir(str(tmp_path)) == ["a.jpg"]
+
+
+def test_safe_rename_without_hard_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check the fallback for file systems without hard links (e.g. exFAT memory cards).
+    """
+    def no_link(source: str, target: str) -> None:
+        """
+        Simulate a file system without hard links.
+
+        :param source: Ignored.
+        :param target: Ignored.
+        :raises PermissionError: Always.
+        """
+        raise PermissionError(errno.EPERM, "operation not permitted")
+
+    monkeypatch.setattr(mr.os, "link", no_link)
+    (tmp_path / "a.jpg").write_bytes(b"a")
+    mr.safe_rename(tmp_path / "a.jpg", tmp_path / "b.jpg", True)
+    assert os.listdir(str(tmp_path)) == ["b.jpg"]
+
+
+def test_safe_copy(tmp_path: Path) -> None:
+    """
+    Check that a copy creates the parent folders, keeps content and times, and never overwrites.
+    """
+    source = tmp_path / "a.jpg"
+    source.write_bytes(b"a")
+    os.utime(str(source), (1_000_000_000, 1_000_000_000))
+    target = tmp_path / "dest" / "sub" / "b.jpg"
+    mr.safe_copy(source, target)
+    assert target.read_bytes() == b"a" and source.read_bytes() == b"a"
+    assert int(target.stat().st_mtime) == 1_000_000_000
+    source.write_bytes(b"changed")
+    with pytest.raises(FileExistsError):
+        mr.safe_copy(source, target)
+    assert target.read_bytes() == b"a"
+
+
+def test_safe_copy_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that a missing source creates no folder and that a partial copy is removed.
+    """
+    with pytest.raises(FileNotFoundError):
+        mr.safe_copy(tmp_path / "missing.jpg", tmp_path / "dest" / "b.jpg")
+    assert not (tmp_path / "dest").exists()
+
+    def broken_copy(reader: Any, writer: Any) -> None:
+        """
+        Write a few bytes, then fail like a full disk.
+
+        :param reader: Ignored.
+        :param writer: Target stream.
+        :raises OSError: Always.
+        """
+        writer.write(b"partial")
+        raise OSError(errno.ENOSPC, "no space left on device")
+
+    monkeypatch.setattr(mr.shutil, "copyfileobj", broken_copy)
+    (tmp_path / "a.jpg").write_bytes(b"a")
+    with pytest.raises(OSError):
+        mr.safe_copy(tmp_path / "a.jpg", tmp_path / "b.jpg")
+    assert not (tmp_path / "b.jpg").exists()
+
+
+def test_execute_plan_in_place(tmp_path: Path) -> None:
+    """
+    Check an in-place execution: renames, auxiliary files, unchanged and skipped entries.
+    """
+    make_tree(tmp_path, ["GX01.MP4", "GX01.THM", "sub/c.jpg", "orphan.lrv", "bad.jpg", BASE + ".jpg"])
+    analyses = [ready("GX01.MP4"), auxiliary("GX01.THM"), ready("sub/c.jpg"), auxiliary("orphan.lrv"),
+                skipped("bad.jpg"), ready(BASE + ".jpg")]
+    plan = mr.build_plan(analyses, PATTERN, tmp_path)
+    results = mr.execute_plan(plan, tmp_path)
+    # Plan order: BASE.jpg, bad.jpg, GX01.MP4, GX01.THM, orphan.lrv, sub/c.jpg.
+    assert [result.status for result in results] == [
+        mr.RESULT_UNCHANGED, mr.RESULT_SKIPPED, mr.RESULT_DONE, mr.RESULT_DONE, mr.RESULT_SKIPPED, mr.RESULT_DONE,
+    ]
+    files = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*") if path.is_file())
+    assert files == sorted([BASE + ".jpg", BASE + ".MP4", BASE + ".THM", "bad.jpg", "orphan.lrv",
+                            "sub/" + BASE + ".jpg"])
+    assert files == sorted([entry.target.as_posix() for entry in plan if entry.target]
+                           + ["bad.jpg", "orphan.lrv"])
+
+
+def test_execute_plan_copy_never_overwrites(tmp_path: Path) -> None:
+    """
+    Check a copy execution: sources intact, no empty folder, a late existing target is not overwritten.
+    """
+    source = tmp_path / "src"
+    make_tree(source, ["a.jpg", "sub/b.jpg", "skipped/bad.jpg"])
+    dest = tmp_path / "dest"
+    plan = mr.build_plan([ready("a.jpg"), ready("sub/b.jpg"), skipped("skipped/bad.jpg")], PATTERN, source, dest)
+    before = snapshot(source)
+    (dest / "sub").mkdir(parents=True)
+    (dest / "sub" / (BASE + ".jpg")).write_bytes(b"late")
+    results = mr.execute_plan(plan, source, dest)
+    assert [result.status for result in results] == [mr.RESULT_DONE, mr.RESULT_SKIPPED, mr.RESULT_FAILED]
+    assert "not overwritten" in results[2].message
+    assert (dest / "sub" / (BASE + ".jpg")).read_bytes() == b"late"
+    assert (dest / (BASE + ".jpg")).is_file() and not (dest / "skipped").exists()
+    assert snapshot(source) == before
+
+
+def test_execute_plan_reports_os_errors(tmp_path: Path) -> None:
+    """
+    Check that a missing source file fails its entry with a readable message.
+    """
+    plan = [mr.PlanEntry(Path("gone.jpg"), Path("x.jpg"), mr.ACTION_RENAME, "", ())]
+    results = mr.execute_plan(plan, tmp_path)
+    assert results[0].status == mr.RESULT_FAILED and "FileNotFoundError" in results[0].message
+
+
+def test_count_and_print_results() -> None:
+    """
+    Check the counters and the printed lines of an execution.
+    """
+    rename = mr.PlanEntry(Path("a.jpg"), Path("x.jpg"), mr.ACTION_RENAME, "", ())
+    copy = mr.PlanEntry(Path("b.jpg"), Path("y.jpg"), mr.ACTION_COPY, "", ())
+    same = mr.PlanEntry(Path("x.jpg"), Path("x.jpg"), mr.ACTION_UNCHANGED, "", ())
+    skip = mr.PlanEntry(Path("c.jpg"), None, mr.ACTION_SKIP, "no date", ())
+    results = [
+        mr.OperationResult(rename, mr.RESULT_DONE, ""),
+        mr.OperationResult(copy, mr.RESULT_DONE, ""),
+        mr.OperationResult(copy, mr.RESULT_FAILED, "target already exists"),
+        mr.OperationResult(same, mr.RESULT_UNCHANGED, "already named"),
+        mr.OperationResult(skip, mr.RESULT_SKIPPED, "no date"),
+    ]
+    assert mr.count_results(results) == {"renamed": 1, "copied": 1, "unchanged": 1, "skipped": 1, "errors": 1}
+    out = io.StringIO()
+    mr.print_results(results, out)
+    assert out.getvalue().splitlines() == [
+        "Results:",
+        "[RENAMED] a.jpg -> x.jpg",
+        "[COPIED]  b.jpg -> y.jpg",
+        "[ERROR]   b.jpg -> y.jpg  (target already exists)",
+        "1 renamed, 1 copied, 1 unchanged, 1 skipped, 1 error(s).",
+    ]
+
+
 # --- real ExifTool integration ------------------------------------------------
 
 
@@ -2363,16 +2567,175 @@ def test_main_analysis_non_interactive_unknown_device(
     assert "unknown device" in capsys.readouterr().err
 
 
-def test_main_analysis_forced_device_and_apply(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
+def test_main_analysis_forced_device(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
-    Check that ``--device`` avoids prompts and that ``--apply`` is reported as not implemented yet.
+    Check that ``--device`` avoids prompts and that the default run only previews.
     """
     write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device(match={"model": "Other"})]})
+    before = snapshot(analyzed_project / "src")
     argv = ["--source", str(analyzed_project / "src"), "--device", "GOPRO9"]
     assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
-    assert "2 ready" in capsys.readouterr().out
-    assert mr.main(argv + ["--apply"], project_root=analyzed_project, interactive=False) == 1
-    assert "not implemented yet" in capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "2 ready" in out and "Preview only: no file was changed" in out
+    assert snapshot(analyzed_project / "src") == before
+
+
+def plan_lines(out: str) -> Dict[str, str]:
+    """
+    Extract the planned targets from the printed plan.
+
+    :param out: Captured standard output.
+    :return: Mapping of source to target, for every printed plan line with a target.
+    """
+    found = {}
+    for line in out.splitlines():
+        if line.startswith(("[RENAME]", "[COPY]")) and " -> " in line:
+            source, target = line.split("]", 1)[1].strip().split(" -> ")
+            found[source] = target.split("  (")[0]
+    return found
+
+
+def test_main_apply_renames_in_place(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that ``--apply`` renames the files exactly as previewed.
+    """
+    write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
+    source = analyzed_project / "src"
+    argv = ["--source", str(source)]
+    assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
+    previewed = plan_lines(capsys.readouterr().out)
+    assert mr.main(argv + ["--apply"], project_root=analyzed_project, interactive=False) == 0
+    out = capsys.readouterr().out
+    assert plan_lines(out) == previewed
+    assert "[RENAMED] a.jpg -> 2024-01-02_02-04-05_GoPro9.jpg" in out
+    assert "2 renamed, 0 copied, 0 unchanged, 0 skipped, 0 error(s)." in out
+    assert sorted(path.name for path in source.iterdir()) == sorted(previewed.values())
+    assert (source / previewed["a.jpg"]).read_bytes() == b"a"
+    assert (source / previewed["b.jpg"]).read_bytes() == b"b"
+    assert mr.main(argv + ["--apply"], project_root=analyzed_project, interactive=False) == 0
+    assert "0 renamed, 0 copied, 2 unchanged" in capsys.readouterr().out
+
+
+def test_main_apply_copies_to_destination(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that ``--dest`` with ``--apply`` creates the destination, copies and keeps the sources intact.
+    """
+    write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
+    source = analyzed_project / "src"
+    dest = analyzed_project / "out" / "photos"
+    before = snapshot(source)
+    argv = ["--source", str(source), "--dest", str(dest), "--apply"]
+    assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
+    out = capsys.readouterr().out
+    assert "0 renamed, 2 copied" in out
+    assert snapshot(source) == before
+    assert (dest / "2024-01-02_02-04-05_GoPro9.jpg").read_bytes() == b"a"
+    assert (dest / "2024-01-02_02-04-05_GoPro9_01.jpg").read_bytes() == b"b"
+    assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
+    out = capsys.readouterr().out
+    assert "2024-01-02_02-04-05_GoPro9_02.jpg" in out and "2 copied, 0 unchanged, 0 skipped, 0 error(s)" in out
+    assert len(list(dest.iterdir())) == 4
+
+
+def test_main_apply_recursive(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that a recursive run keeps subfolders in place and recreates only non-empty folders under ``--dest``.
+    """
+    write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
+    source = analyzed_project / "src"
+    make_tree(source, ["sub/notes.txt", "other/readme.txt"])
+    (source / "sub" / "deep").mkdir()
+    (source / "sub" / "deep" / "c.jpg").write_bytes(b"c")
+    (source / "empty").mkdir()
+    dest = analyzed_project / "dest"
+    before = snapshot(source)
+    argv = ["--source", str(source), "--recursive", "--dest", str(dest)]
+    assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
+    assert "[COPY]   sub/deep/c.jpg -> sub/deep/2024-01-02_02-04-05_GoPro9.jpg" in capsys.readouterr().out
+    assert not dest.exists()
+    assert mr.main(argv + ["--apply"], project_root=analyzed_project, interactive=False) == 0
+    assert snapshot(source) == before
+    copied = sorted(path.relative_to(dest).as_posix() for path in dest.rglob("*"))
+    assert copied == ["2024-01-02_02-04-05_GoPro9.jpg", "2024-01-02_02-04-05_GoPro9_01.jpg",
+                      "sub", "sub/deep", "sub/deep/2024-01-02_02-04-05_GoPro9.jpg"]
+    capsys.readouterr()
+    assert mr.main(["--source", str(source), "--recursive", "--apply"], project_root=analyzed_project,
+                   interactive=False) == 0
+    assert (source / "sub" / "deep" / "2024-01-02_02-04-05_GoPro9.jpg").read_bytes() == b"c"
+    assert (source / "sub" / "notes.txt").is_file() and (source / "empty").is_dir()
+    assert "3 renamed" in capsys.readouterr().out
+
+
+def test_main_apply_resolves_unknown_devices_first(
+    analyzed_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """
+    Check that unknown devices are registered before any file is renamed, and that a
+    non-interactive run with an unknown device changes nothing.
+    """
+    source = analyzed_project / "src"
+    before = snapshot(source)
+    argv = ["--source", str(source), "--apply"]
+    assert mr.main(argv, project_root=analyzed_project, interactive=False) == 1
+    assert snapshot(source) == before
+    answers = iter(["GoPro9", "", ""])
+
+    def answer(prompt: str) -> str:
+        """
+        Answer a question after checking that no file was modified yet.
+
+        :param prompt: Question shown.
+        :return: Scripted answer.
+        """
+        assert snapshot(source) == before
+        return next(answers)
+
+    assert mr.main(argv, project_root=analyzed_project, interactive=True, input_func=answer) == 0
+    assert "2 renamed" in capsys.readouterr().out
+
+
+def test_main_dry_run_by_default_false(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that ``dry_run_by_default: false`` applies without ``--apply`` and that ``--dry-run`` still previews.
+    """
+    write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
+    config_path = analyzed_project / "conf" / "config.json"
+    config = mr.load_json_file(config_path)
+    config["dry_run_by_default"] = False
+    write_json(config_path, config)
+    source = analyzed_project / "src"
+    before = snapshot(source)
+    assert mr.main(["--source", str(source), "--dry-run"], project_root=analyzed_project, interactive=False) == 0
+    assert "Preview only" in capsys.readouterr().out
+    assert snapshot(source) == before
+    assert mr.main(["--source", str(source)], project_root=analyzed_project, interactive=False) == 0
+    assert "2 renamed" in capsys.readouterr().out
+
+
+def test_main_apply_reports_errors(
+    analyzed_project: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Check that a failed operation is reported and makes the run exit with code 1.
+    """
+    write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
+
+    def refuse(source: Path, target: Path) -> None:
+        """
+        Simulate a target created after the plan was built.
+
+        :param source: Ignored.
+        :param target: Ignored.
+        :raises FileExistsError: Always.
+        """
+        raise FileExistsError(target)
+
+    monkeypatch.setattr(mr, "safe_rename", refuse)
+    assert mr.main(["--source", str(analyzed_project / "src"), "--apply"], project_root=analyzed_project,
+                   interactive=False) == 1
+    out = capsys.readouterr().out
+    assert "[ERROR]   a.jpg -> 2024-01-02_02-04-05_GoPro9.jpg  (target already exists, not overwritten" in out
+    assert "2 error(s)" in out
 
 
 def test_main_analysis_applies_offset_and_tz(

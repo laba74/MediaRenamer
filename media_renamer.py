@@ -1,6 +1,7 @@
 """MediaRenamer entry point: renames photos and videos from their metadata."""
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -108,6 +109,11 @@ WINDOWS_RESERVED_NAMES = frozenset(
 )
 COLLISION_SUFFIX_FORMAT = "_{:02d}"
 
+RESULT_DONE = "done"
+RESULT_FAILED = "failed"
+RESULT_UNCHANGED = "unchanged"
+RESULT_SKIPPED = "skipped"
+
 
 class ConfigError(Exception):
     """Raised when a configuration file is missing, unreadable or invalid."""
@@ -166,6 +172,14 @@ class PlanEntry(NamedTuple):
     warnings: Tuple[str, ...]
 
 
+class OperationResult(NamedTuple):
+    """Outcome of executing one plan entry."""
+
+    entry: PlanEntry
+    status: str
+    message: str
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """
     Build the command line parser with every option of the plan.
@@ -182,10 +196,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Copy renamed files to this folder instead of renaming in place.",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--apply",
         action="store_true",
         help="Perform the renames or copies (preview only by default).",
+    )
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview only, even when dry_run_by_default is false in conf/config.json.",
     )
     parser.add_argument(
         "--recursive",
@@ -1955,6 +1975,187 @@ def print_plan(entries: Sequence[PlanEntry], out: TextIO) -> None:
                 print("         warning: {}".format(warning), file=out)
 
 
+def should_apply(apply_flag: bool, dry_run_flag: bool, dry_run_by_default: bool) -> bool:
+    """
+    Decide whether the plan is executed or only previewed.
+
+    ``--dry-run`` always previews, ``--apply`` always executes; without either
+    flag, ``dry_run_by_default`` from ``conf/config.json`` decides.
+
+    :param apply_flag: Value of ``--apply``.
+    :param dry_run_flag: Value of ``--dry-run``.
+    :param dry_run_by_default: Value of ``dry_run_by_default``.
+    :return: ``True`` when files must be renamed or copied.
+    """
+    if dry_run_flag:
+        return False
+    if apply_flag:
+        return True
+    return not dry_run_by_default
+
+
+def is_same_file(first: Path, second: Path) -> bool:
+    """
+    Tell whether two paths designate the same file (e.g. a case-only difference).
+
+    :param first: First path.
+    :param second: Second path.
+    :return: ``True`` when both paths exist and are the same file.
+    """
+    try:
+        return os.path.samefile(str(first), str(second))
+    except OSError:
+        return False
+
+
+def safe_rename(source: Path, target: Path, use_hard_link: Optional[bool] = None) -> None:
+    """
+    Rename a file without ever overwriting an existing one.
+
+    A target that is the source itself (case-only rename on a case-insensitive
+    file system) is allowed. On Windows, ``os.rename`` refuses existing targets.
+    Elsewhere, a hard link is created first (it fails if the target exists),
+    then the old name is removed; file systems without hard links (e.g. FAT or
+    exFAT memory cards) fall back to a checked ``os.rename``.
+
+    :param source: Existing file.
+    :param target: New path, in an existing folder.
+    :param use_hard_link: Use the hard link strategy; ``True`` everywhere but Windows when ``None``.
+    :raises FileExistsError: If the target already exists.
+    :raises OSError: If the file cannot be renamed.
+    """
+    link = os.name != "nt" if use_hard_link is None else use_hard_link
+    if os.path.lexists(str(target)):
+        if not is_same_file(source, target):
+            raise FileExistsError(errno.EEXIST, "target already exists", str(target))
+        os.rename(str(source), str(target))
+        return
+    if not link or os.path.islink(str(source)):
+        os.rename(str(source), str(target))
+        return
+    try:
+        os.link(str(source), str(target))
+    except FileExistsError:
+        raise
+    except OSError:
+        if os.path.lexists(str(target)):
+            raise FileExistsError(errno.EEXIST, "target already exists", str(target))
+        os.rename(str(source), str(target))
+        return
+    os.unlink(str(source))
+
+
+def safe_copy(source: Path, target: Path) -> None:
+    """
+    Copy a file without ever overwriting an existing one.
+
+    Missing parent folders of the target are created; the target is created
+    exclusively, its content then times and permissions are copied. A partial
+    copy is removed on failure.
+
+    :param source: Existing file.
+    :param target: Path of the copy.
+    :raises FileExistsError: If the target already exists.
+    :raises OSError: If the file cannot be copied.
+    """
+    with open(str(source), "rb") as reader:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(target), "xb") as writer:
+            try:
+                shutil.copyfileobj(reader, writer)
+            except BaseException:
+                writer.close()
+                os.remove(str(target))
+                raise
+    shutil.copystat(str(source), str(target))
+
+
+def execute_plan(
+    entries: Sequence[PlanEntry], source_root: Path, dest_root: Optional[Path] = None
+) -> List[OperationResult]:
+    """
+    Execute the rename plan built by ``build_plan``.
+
+    Renames happen in place when ``dest_root`` is ``None``; otherwise files are
+    copied under ``dest_root`` and the sources are left intact. Only folders
+    receiving a file are created. An existing file is never overwritten: the
+    entry fails with a clear message and the other entries go on.
+
+    :param entries: Plan entries.
+    :param source_root: Source folder.
+    :param dest_root: Destination folder of ``--dest``; ``None`` to rename in place.
+    :return: One result per entry, in plan order.
+    """
+    target_root = source_root if dest_root is None else dest_root
+    results = []  # type: List[OperationResult]
+    for entry in entries:
+        if entry.action == ACTION_UNCHANGED:
+            results.append(OperationResult(entry, RESULT_UNCHANGED, "already named"))
+            continue
+        if entry.action not in (ACTION_RENAME, ACTION_COPY) or entry.target is None:
+            results.append(OperationResult(entry, RESULT_SKIPPED, entry.message))
+            continue
+        source = source_root / entry.source
+        target = target_root / entry.target
+        try:
+            if entry.action == ACTION_COPY:
+                safe_copy(source, target)
+            else:
+                safe_rename(source, target)
+        except FileExistsError:
+            message = "target already exists, not overwritten: {}".format(target)
+            results.append(OperationResult(entry, RESULT_FAILED, message))
+        except OSError as error:
+            results.append(OperationResult(entry, RESULT_FAILED, "{}: {}".format(
+                type(error).__name__, error.strerror or error)))
+        else:
+            results.append(OperationResult(entry, RESULT_DONE, ""))
+    return results
+
+
+def count_results(results: Iterable[OperationResult]) -> Dict[str, int]:
+    """
+    Count the results of an executed plan.
+
+    :param results: Operation results.
+    :return: Counts keyed by ``renamed``, ``copied``, ``unchanged``, ``skipped`` and ``errors``.
+    """
+    counts = {"renamed": 0, "copied": 0, "unchanged": 0, "skipped": 0, "errors": 0}
+    for result in results:
+        if result.status == RESULT_DONE:
+            counts["copied" if result.entry.action == ACTION_COPY else "renamed"] += 1
+        elif result.status == RESULT_FAILED:
+            counts["errors"] += 1
+        elif result.status == RESULT_UNCHANGED:
+            counts["unchanged"] += 1
+        else:
+            counts["skipped"] += 1
+    return counts
+
+
+def print_results(results: Sequence[OperationResult], out: TextIO) -> None:
+    """
+    Print the performed operations, their errors and a summary.
+
+    :param results: Operation results.
+    :param out: Output stream.
+    """
+    labels = {ACTION_RENAME: "[RENAMED]", ACTION_COPY: "[COPIED] "}
+    print("Results:", file=out)
+    for result in results:
+        if result.status not in (RESULT_DONE, RESULT_FAILED):
+            continue
+        label = labels.get(result.entry.action, "[DONE]   ") if result.status == RESULT_DONE else "[ERROR]  "
+        line = "{} {} -> {}".format(label, result.entry.source.as_posix(),
+                                    result.entry.target.as_posix() if result.entry.target else "?")
+        if result.message:
+            line += "  ({})".format(result.message)
+        print(line, file=out)
+    counts = count_results(results)
+    print("{renamed} renamed, {copied} copied, {unchanged} unchanged, {skipped} skipped, "
+          "{errors} error(s).".format(**counts), file=out)
+
+
 def run_check(
     project_root: Path,
     timezone: Optional[str] = None,
@@ -2085,12 +2286,15 @@ def main(
         return 1
     print_analysis(analyses, sys.stdout)
     dest_root = Path(args.dest) if args.dest else None
-    print_plan(build_plan(analyses, config["filename_pattern"], source, dest_root), sys.stdout)
-    if args.apply:
-        print("[ERROR] Renaming and copying are not implemented yet (see docs/BACKLOG.md, Epic 5).",
-              file=sys.stderr)
-        return 1
-    return 0
+    # The same plan is printed and executed, so preview and apply always agree.
+    plan = build_plan(analyses, config["filename_pattern"], source, dest_root)
+    print_plan(plan, sys.stdout)
+    if not should_apply(args.apply, args.dry_run, config["dry_run_by_default"]):
+        print("Preview only: no file was changed. Use --apply to perform these operations.")
+        return 0
+    results = execute_plan(plan, source, dest_root)
+    print_results(results, sys.stdout)
+    return 1 if count_results(results)["errors"] else 0
 
 
 if __name__ == "__main__":
