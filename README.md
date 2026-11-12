@@ -18,7 +18,29 @@ ExifTool is asked for these tags only (no GPS or other personal data is read). T
 
 Sub-seconds are ignored. Zero or impossible dates (e.g. `0000:00:00 00:00:00`) are treated as missing. A file without any valid date is reported and skipped: the file system date is never used.
 
-Most of these tags carry no time zone. QuickTime dates are often UTC in theory, but many cameras (GoPro among them) store local time. Device offsets and time zone handling are covered in a later step.
+For `DateTimeOriginal` and `CreateDate`, the EXIF 2.31 offset tags `OffsetTimeOriginal` and `OffsetTimeDigitized` are also read: when present and valid, they give the date's UTC offset.
+
+### Effective date: clock offset and time zone
+
+The date used in file names (the *effective date*) is computed in two steps. The original metadata is never written.
+
+1. **Clock offset.** The device's `offset` (signed `HH:MM:SS`, e.g. `-01:00:00`) is added to the date read from the file. It corrects a camera clock that was wrong (late, early, or left on another zone); it does not replace the time zone. Rollovers to the previous/next day, month, year and leap days are handled.
+2. **Time zone.** The corrected date is normalized to UTC **only when its zone is known**, in this order:
+   1. a UTC offset stored in the file (`+02:00`, `Z`, or an `OffsetTime*` tag);
+   2. `--tz ZONE`, the explicit policy for the whole batch;
+   3. the device's optional `timezone` in `conf/devices.json`.
+
+   Otherwise the naive local time of the camera is kept, unchanged. The preview shows `UTC` or `local` after each date, and the zone used with its source.
+
+**Daylight saving time.** When a zone is applied, a local time that occurs twice (clocks set back, e.g. 02:30 on 27 October 2024 in `Europe/Paris`) or never (clocks set forward, e.g. 02:30 on 31 March 2024) cannot be converted reliably. Such files keep their local time and a warning is printed: nothing is converted silently.
+
+**Time zone database.** IANA zones need Python 3.9+ and a time zone database. Linux and macOS provide one; on Windows, the `tzdata` package is needed (installed by `uv sync`). Without it, `--tz` is rejected and device zones produce a warning while the local time is kept.
+
+### Limits of zone-less metadata
+
+- Most EXIF dates and many video dates carry no zone: they are the camera's wall-clock time, whatever the zone it was set to. Without `--tz` or a device `timezone`, file names use that wall-clock time as is.
+- QuickTime dates (`CreateDate`, `MediaCreateDate`, `TrackCreateDate` in videos) are UTC according to the specification, but many cameras (GoPro among them) store local time. ExifTool returns them as they are, and they are treated as zone-less local time. If a camera really writes UTC, set its device `timezone` to `UTC`, or adjust its `offset`.
+- A zone applies to the whole batch (`--tz`) or to a whole device: photos taken while travelling across zones need separate runs, or the camera clock set to the local zone.
 
 ### Device matching
 

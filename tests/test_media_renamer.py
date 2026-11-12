@@ -1128,6 +1128,230 @@ def test_select_capture_date_priority() -> None:
     assert mr.select_capture_date({"FileModifyDate": "2022:05:06 07:08:09"}) is None
 
 
+def test_select_capture_date_uses_offset_tags() -> None:
+    """
+    Check that ``OffsetTimeOriginal`` makes the date aware, and that invalid offsets are ignored.
+    """
+    tags = {"DateTimeOriginal": "2024:07:14 17:19:24", "OffsetTimeOriginal": "+02:00"}
+    expected = datetime(2024, 7, 14, 17, 19, 24, tzinfo=timezone(timedelta(hours=2)))
+    assert mr.select_capture_date(tags) == ("DateTimeOriginal", expected)
+    tags = {"CreateDate": "2024:07:14 17:19:24", "OffsetTimeDigitized": "-05:00"}
+    assert mr.select_capture_date(tags)[1].utcoffset() == timedelta(hours=-5)
+    tags = {"DateTimeOriginal": "2024:07:14 17:19:24", "OffsetTimeOriginal": "   :  "}
+    assert mr.select_capture_date(tags)[1].tzinfo is None
+    tags = {"MediaCreateDate": "2024:07:14 17:19:24", "OffsetTimeOriginal": "+02:00"}
+    assert mr.select_capture_date(tags)[1].tzinfo is None
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("Z", timedelta(0)),
+        ("+02:00", timedelta(hours=2)),
+        ("-0530", timedelta(hours=-5, minutes=-30)),
+        (" +14:00 ", timedelta(hours=14)),
+        ("+24:00", None),
+        ("+02:60", None),
+        ("02:00", None),
+        ("", None),
+        (None, None),
+        (2, None),
+    ],
+)
+def test_parse_utc_offset(value: Any, expected: Optional[timedelta]) -> None:
+    """
+    Check valid and invalid UTC offsets.
+    """
+    zone = mr.parse_utc_offset(value)
+    assert (zone.utcoffset(None) if zone else None) == expected
+
+
+# --- offsets and time zones ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "date, offset, expected",
+    [
+        (datetime(2024, 1, 2, 3, 4, 5), "+00:00:00", datetime(2024, 1, 2, 3, 4, 5)),
+        (datetime(2024, 1, 2, 3, 4, 5), "+01:30:15", datetime(2024, 1, 2, 4, 34, 20)),
+        (datetime(2024, 1, 2, 3, 4, 5), "-01:00:00", datetime(2024, 1, 2, 2, 4, 5)),
+        (datetime(2024, 1, 2, 3, 4, 5), "00:00:30", datetime(2024, 1, 2, 3, 4, 35)),
+        (datetime(2024, 1, 31, 23, 30, 0), "+01:00:00", datetime(2024, 2, 1, 0, 30, 0)),
+        (datetime(2024, 1, 1, 0, 30, 0), "-01:00:00", datetime(2023, 12, 31, 23, 30, 0)),
+        (datetime(2023, 12, 31, 23, 59, 59), "+00:00:01", datetime(2024, 1, 1, 0, 0, 0)),
+        (datetime(2024, 2, 28, 23, 0, 0), "+02:00:00", datetime(2024, 2, 29, 1, 0, 0)),
+        (datetime(2024, 3, 1, 0, 30, 0), "-01:00:00", datetime(2024, 2, 29, 23, 30, 0)),
+        (datetime(2023, 2, 28, 23, 0, 0), "+02:00:00", datetime(2023, 3, 1, 1, 0, 0)),
+        (datetime(2024, 1, 1, 12, 0, 0), "-48:00:00", datetime(2023, 12, 30, 12, 0, 0)),
+    ],
+)
+def test_apply_offset(date: datetime, offset: str, expected: datetime) -> None:
+    """
+    Check positive and negative offsets with day, month, year and leap-day rollovers.
+    """
+    assert mr.apply_offset(date, offset) == expected
+
+
+def test_apply_offset_keeps_time_zone_and_rejects_bad_values() -> None:
+    """
+    Check that an aware date stays aware, and that invalid or overflowing offsets fail.
+    """
+    zone = timezone(timedelta(hours=2))
+    assert mr.apply_offset(datetime(2024, 1, 1, 12, tzinfo=zone), "-01:00:00") == datetime(
+        2024, 1, 1, 11, tzinfo=zone)
+    with pytest.raises(ValueError, match="invalid offset"):
+        mr.apply_offset(datetime(2024, 1, 1), "1h")
+    with pytest.raises(ValueError, match="out of range"):
+        mr.apply_offset(datetime(9999, 12, 31, 23), "+02:00:00")
+
+
+@pytest.fixture
+def paris() -> Any:
+    """
+    Load the Europe/Paris zone, or skip the test when no time zone database is available.
+
+    :return: The ``ZoneInfo`` object.
+    """
+    try:
+        return mr.load_zone("Europe/Paris")
+    except ValueError as error:
+        pytest.skip(str(error))
+
+
+def test_load_zone(paris: Any) -> None:
+    """
+    Check that a known zone loads and that unknown zones are reported.
+    """
+    assert str(paris) == "Europe/Paris"
+    with pytest.raises(ValueError, match="not found"):
+        mr.load_zone("Europe/Atlantis")
+
+
+def test_check_cli_timezone(paris: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check syntax errors, unknown zones and a missing time zone database for ``--tz``.
+    """
+    assert mr.check_cli_timezone("Europe/Paris") is None
+    assert "invalid time zone" in mr.check_cli_timezone("not a zone")
+    assert "unknown time zone" in mr.check_cli_timezone("Europe/Atlantis")
+    monkeypatch.setattr(mr, "zoneinfo", None)
+    assert "Python 3.9" in mr.check_cli_timezone("Europe/Paris")
+
+
+def test_load_zone_without_zoneinfo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check the error raised when ``zoneinfo`` is unavailable (Python 3.8).
+    """
+    monkeypatch.setattr(mr, "zoneinfo", None)
+    with pytest.raises(ValueError, match="Python 3.9"):
+        mr.load_zone("Europe/Paris")
+
+
+@pytest.mark.parametrize(
+    "local, expected",
+    [
+        (datetime(2024, 7, 14, 12, 0, 0), mr.LOCAL_TIME_VALID),
+        (datetime(2024, 10, 27, 2, 30, 0), mr.LOCAL_TIME_AMBIGUOUS),
+        (datetime(2024, 3, 31, 2, 30, 0), mr.LOCAL_TIME_NONEXISTENT),
+        (datetime(2024, 3, 31, 3, 0, 0), mr.LOCAL_TIME_VALID),
+        (datetime(2024, 10, 27, 3, 0, 0), mr.LOCAL_TIME_VALID),
+    ],
+)
+def test_classify_local_time(paris: Any, local: datetime, expected: str) -> None:
+    """
+    Check normal, ambiguous (clocks set back) and non-existent (clocks set forward) local times.
+    """
+    assert mr.classify_local_time(local, paris) == expected
+
+
+def test_choose_zone() -> None:
+    """
+    Check that ``--tz`` wins over the device zone, and that no zone is the default.
+    """
+    device = make_device(timezone="Europe/Paris")
+    assert mr.choose_zone(device, "Asia/Tokyo") == ("Asia/Tokyo", mr.ZONE_SOURCE_CLI)
+    assert mr.choose_zone(device, None) == ("Europe/Paris", mr.ZONE_SOURCE_DEVICE)
+    assert mr.choose_zone(make_device(), None) == ("", "")
+
+
+def test_compute_effective_date_without_zone() -> None:
+    """
+    Check that a zone-less date only gets the clock offset and stays naive.
+    """
+    effective = mr.compute_effective_date(datetime(2024, 1, 2, 3, 4, 5), make_device())
+    assert effective == mr.EffectiveDate(datetime(2024, 1, 2, 2, 4, 5), "", "", ())
+
+
+def test_compute_effective_date_with_device_zone(paris: Any) -> None:
+    """
+    Check normalization to UTC with the device zone, offset applied first (winter and summer).
+    """
+    device = make_device(timezone="Europe/Paris")
+    winter = mr.compute_effective_date(datetime(2024, 1, 2, 3, 4, 5), device)
+    assert winter.value == datetime(2024, 1, 2, 1, 4, 5, tzinfo=timezone.utc)
+    assert (winter.zone, winter.zone_source, winter.warnings) == ("Europe/Paris", mr.ZONE_SOURCE_DEVICE, ())
+    summer = mr.compute_effective_date(datetime(2024, 7, 1, 0, 30, 0), device)
+    assert summer.value == datetime(2024, 6, 30, 21, 30, 0, tzinfo=timezone.utc)
+
+
+def test_compute_effective_date_with_cli_zone(paris: Any) -> None:
+    """
+    Check that ``--tz`` overrides the device zone.
+    """
+    device = make_device(offset="+00:00:00", timezone="Asia/Tokyo")
+    effective = mr.compute_effective_date(datetime(2024, 1, 2, 12, 0, 0), device, "Europe/Paris")
+    assert effective.value == datetime(2024, 1, 2, 11, 0, 0, tzinfo=timezone.utc)
+    assert (effective.zone, effective.zone_source) == ("Europe/Paris", mr.ZONE_SOURCE_CLI)
+
+
+def test_compute_effective_date_with_metadata_offset() -> None:
+    """
+    Check that an offset stored in the metadata wins over ``--tz`` and the device zone.
+    """
+    date = datetime(2024, 1, 2, 12, 0, 0, tzinfo=timezone(timedelta(hours=9)))
+    effective = mr.compute_effective_date(date, make_device(timezone="Europe/Paris"), "America/New_York")
+    assert effective.value == datetime(2024, 1, 2, 2, 0, 0, tzinfo=timezone.utc)
+    assert (effective.zone, effective.zone_source, effective.warnings) == ("+0900", mr.ZONE_SOURCE_METADATA, ())
+
+
+@pytest.mark.parametrize(
+    "local, expected",
+    [
+        (datetime(2024, 10, 27, 3, 30, 0), "occurs twice"),
+        (datetime(2024, 3, 31, 3, 30, 0), "does not exist"),
+    ],
+)
+def test_compute_effective_date_dst_warnings(paris: Any, local: datetime, expected: str) -> None:
+    """
+    Check that ambiguous and non-existent times (after the offset) are kept local with a warning.
+    """
+    effective = mr.compute_effective_date(local, make_device(), "Europe/Paris")
+    assert effective.value == local - timedelta(hours=1)
+    assert effective.value.tzinfo is None and effective.zone == ""
+    assert len(effective.warnings) == 1
+    assert expected in effective.warnings[0] and "Europe/Paris" in effective.warnings[0]
+
+
+def test_compute_effective_date_unavailable_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that a zone missing from the database keeps the local time with a warning.
+    """
+    monkeypatch.setattr(mr, "zoneinfo", None)
+    effective = mr.compute_effective_date(datetime(2024, 1, 2, 3, 4, 5), make_device(timezone="Europe/Paris"))
+    assert effective.value == datetime(2024, 1, 2, 2, 4, 5)
+    assert "local time kept" in effective.warnings[0]
+
+
+def test_format_effective_date() -> None:
+    """
+    Check the display of UTC and local effective dates.
+    """
+    utc = mr.EffectiveDate(datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc), "Europe/Paris", "--tz", ())
+    local = mr.EffectiveDate(datetime(2024, 1, 2, 3, 4, 5), "", "", ())
+    assert mr.format_effective_date(utc) == "2024-01-02 03:04:05 UTC"
+    assert mr.format_effective_date(local) == "2024-01-02 03:04:05 local"
+
+
 # --- device identification ----------------------------------------------------
 
 
@@ -1462,12 +1686,59 @@ def test_print_analysis_hides_serial_numbers() -> None:
         mr.analyze_file(Path("c.jpg"), None, "File format error", []),
     ]
     out = io.StringIO()
-    mr.print_analysis(analyses, out)
+    mr.print_analysis(mr.add_effective_dates(analyses), out)
     text = out.getvalue()
-    assert "[OK]   sub/a.jpg  2024-01-02 03:04:05 (DateTimeOriginal)  device 'GoPro9'" in text
+    assert ("[OK]   sub/a.jpg  2024-01-02 02:04:05 local  device 'GoPro9'  "
+            "(DateTimeOriginal 2024-01-02 03:04:05, offset -01:00:00)") in text
     assert "[AUX]  b.thm" in text and "[SKIP] c.jpg  unreadable metadata (File format error)" in text
-    assert "3 file(s): 1 ready, 1 auxiliary, 1 skipped." in text
+    assert "3 file(s): 1 ready, 1 auxiliary, 1 skipped, 0 warning(s)." in text
     assert "C3441326974391" not in text
+
+
+def test_print_analysis_without_effective_date_and_with_warnings(paris: Any) -> None:
+    """
+    Check the fallback display without effective date, and the warning lines and count.
+    """
+    plain = mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [make_device()])
+    out = io.StringIO()
+    mr.print_analysis([plain], out)
+    assert "[OK]   a.jpg  2024-01-02 03:04:05  device 'GoPro9'" in out.getvalue()
+    tags = dict(DATED_TAGS, DateTimeOriginal="2024:10:27 03:30:00")
+    ambiguous = mr.analyze_file(Path("b.jpg"), tags, None, [make_device()])
+    out = io.StringIO()
+    mr.print_analysis(mr.add_effective_dates([ambiguous], "Europe/Paris"), out)
+    text = out.getvalue()
+    assert "[OK]   b.jpg  2024-10-27 02:30:00 local" in text
+    assert "       warning: 2024-10-27 02:30:00 occurs twice (clocks set back) in Europe/Paris" in text
+    assert "1 warning(s)." in text
+
+
+def test_describe_date_source(paris: Any) -> None:
+    """
+    Check the description of the date tag, the offset (hidden when zero) and the zone.
+    """
+    zero = make_device(offset="+00:00:00")
+    analysis = mr.add_effective_dates([mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [zero])])[0]
+    assert mr.describe_date_source(analysis) == "DateTimeOriginal 2024-01-02 03:04:05"
+    analysis = mr.add_effective_dates([mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [make_device()])],
+                                      "Europe/Paris")[0]
+    assert mr.describe_date_source(analysis) == (
+        "DateTimeOriginal 2024-01-02 03:04:05, offset -01:00:00, zone Europe/Paris (--tz)")
+
+
+def test_add_effective_dates() -> None:
+    """
+    Check that only ready files get an effective date, and that an out-of-range result is skipped.
+    """
+    ready = mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [make_device()])
+    aux = mr.analyze_file(Path("a.thm"), None, None, [])
+    late = mr.analyze_file(Path("z.jpg"), dict(DATED_TAGS, DateTimeOriginal="9999:12:31 23:30:00"), None,
+                           [make_device(offset="+01:00:00")])
+    result = mr.add_effective_dates([ready, aux, late])
+    assert result[0].effective.value == datetime(2024, 1, 2, 2, 4, 5)
+    assert result[1] == aux
+    assert result[2].status == mr.STATUS_SKIPPED and "out of range" in result[2].message
+    assert ready.effective is None
 
 
 # --- real ExifTool integration ------------------------------------------------
@@ -1599,6 +1870,26 @@ def test_analyze_source_real_samples(real_samples: Path, real_exiftool: Path, tm
     assert snapshot(real_samples) == before
 
 
+def test_effective_dates_leave_metadata_unchanged(real_samples: Path, real_exiftool: Path, tmp_path: Path) -> None:
+    """
+    Check that offsets and time zones change the effective date only, never the files or their metadata.
+    """
+    paths = sorted(path for path in real_samples.rglob("*") if path.is_file())
+    metadata_before, _ = mr.read_metadata(real_exiftool, paths)
+    before = snapshot(real_samples)
+    devices = [make_device(match={"model": "HERO9 Black"}, offset="+01:30:00", timezone="Europe/Paris"),
+               make_device(id="eos", label="EOS6D", match={"model": "EOS 6D"}, offset="-00:00:30")]
+    devices_path = write_json(tmp_path / "devices.json", {"devices": devices})
+    analyses = mr.analyze_source(real_samples, [".jpg", ".mp4", ".dng"], devices, devices_path, real_exiftool,
+                                 recursive=True, cli_tz="UTC")
+    by_name = {analysis.relative.as_posix(): analysis for analysis in analyses}
+    assert by_name["été/GOPR0001.JPG"].effective.value == datetime(2024, 3, 1, 1, 29, 58, tzinfo=timezone.utc)
+    assert by_name["raw/IMG_0001.DNG"].effective.value == datetime(2023, 12, 31, 7, 59, 30, tzinfo=timezone.utc)
+    metadata_after, _ = mr.read_metadata(real_exiftool, paths)
+    assert metadata_after == metadata_before
+    assert snapshot(real_samples) == before
+
+
 # --- main ---------------------------------------------------------------------
 
 
@@ -1706,6 +1997,31 @@ def test_main_analysis_forced_device_and_apply(analyzed_project: Path, capsys: p
     assert "2 ready" in capsys.readouterr().out
     assert mr.main(argv + ["--apply"], project_root=analyzed_project, interactive=False) == 1
     assert "not implemented yet" in capsys.readouterr().err
+
+
+def test_main_analysis_applies_offset_and_tz(
+    analyzed_project: Path, capsys: pytest.CaptureFixture, paris: Any
+) -> None:
+    """
+    Check that ``--tz`` normalizes the effective dates to UTC after the device offset.
+    """
+    write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
+    argv = ["--source", str(analyzed_project / "src"), "--tz", "Europe/Paris"]
+    assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
+    out = capsys.readouterr().out
+    assert "[OK]   a.jpg  2024-01-02 01:04:05 UTC  device 'GoPro9'" in out
+    assert "zone Europe/Paris (--tz)" in out
+
+
+def test_main_rename_tz_without_database(
+    checked_project: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Check that ``--tz`` is rejected when its zone cannot be loaded.
+    """
+    monkeypatch.setattr(mr, "zoneinfo", None)
+    assert mr.main(["--source", "in", "--tz", "Europe/Paris"], project_root=checked_project) == 1
+    assert "Python 3.9" in capsys.readouterr().err
 
 
 def test_main_analysis_missing_exiftool(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:

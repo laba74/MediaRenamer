@@ -67,14 +67,24 @@ AUXILIARY_EXTENSIONS = (".lrv", ".thm")
 # Capture date tags, by decreasing priority. The first one holding a valid date
 # wins. File system dates (FileModifyDate...) are never used.
 DATE_TAGS = ("DateTimeOriginal", "CreateDate", "MediaCreateDate", "TrackCreateDate")
+# EXIF 2.31 offset tags giving the UTC offset of a zone-less date tag.
+DATE_OFFSET_TAGS = {"DateTimeOriginal": "OffsetTimeOriginal", "CreateDate": "OffsetTimeDigitized"}
 IDENTITY_TAGS = ("Make", "Model", "SerialNumber")
 # Only these tags are requested from ExifTool, so GPS and other personal data
 # never enter the program.
-METADATA_TAGS = DATE_TAGS + IDENTITY_TAGS + ("Error",)
+METADATA_TAGS = DATE_TAGS + tuple(DATE_OFFSET_TAGS.values()) + IDENTITY_TAGS + ("Error",)
 EXIF_DATE_RE = re.compile(
     r"^(\d{4})[:-](\d{2})[:-](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?"
     r"\s*(Z|[+-]\d{2}:?\d{2})?$"
 )
+UTC_OFFSET_RE = re.compile(r"^(Z|([+-])(\d{2}):?(\d{2}))$")
+
+LOCAL_TIME_VALID = "valid"
+LOCAL_TIME_AMBIGUOUS = "ambiguous"
+LOCAL_TIME_NONEXISTENT = "nonexistent"
+ZONE_SOURCE_METADATA = "metadata"
+ZONE_SOURCE_CLI = "--tz"
+ZONE_SOURCE_DEVICE = "device"
 
 STATUS_READY = "ready"
 STATUS_AUXILIARY = "auxiliary"
@@ -103,6 +113,15 @@ class DeviceIdentity(NamedTuple):
     serial_number: str
 
 
+class EffectiveDate(NamedTuple):
+    """Date used in file names, after clock offset and time zone policy."""
+
+    value: datetime
+    zone: str
+    zone_source: str
+    warnings: Tuple[str, ...]
+
+
 class FileAnalysis(NamedTuple):
     """Result of analyzing one discovered file."""
 
@@ -113,6 +132,7 @@ class FileAnalysis(NamedTuple):
     date: Optional[datetime]
     identity: DeviceIdentity
     device: Optional[Dict[str, Any]]
+    effective: Optional[EffectiveDate] = None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -902,14 +922,10 @@ def parse_exif_datetime(value: Any) -> Optional[datetime]:
     if not match:
         return None
     year, month, day, hour, minute, second, zone = match.groups()
+    tzinfo = parse_utc_offset(zone) if zone else None
+    if zone and tzinfo is None:
+        return None
     try:
-        tzinfo = None
-        if zone == "Z":
-            tzinfo = timezone.utc
-        elif zone:
-            digits = zone[1:].replace(":", "")
-            delta = timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
-            tzinfo = timezone(-delta if zone[0] == "-" else delta)
         return datetime(
             int(year), int(month), int(day), int(hour), int(minute), int(second or 0), tzinfo=tzinfo
         )
@@ -917,18 +933,187 @@ def parse_exif_datetime(value: Any) -> Optional[datetime]:
         return None
 
 
+def parse_utc_offset(value: Any) -> Optional[timezone]:
+    """
+    Parse a UTC offset such as ``"+02:00"``, ``"-0530"`` or ``"Z"``.
+
+    :param value: Offset text, e.g. the value of the ``OffsetTimeOriginal`` tag.
+    :return: The matching fixed-offset time zone, or ``None`` when the value is not a valid offset.
+    """
+    if not isinstance(value, str):
+        return None
+    match = UTC_OFFSET_RE.match(value.strip())
+    if not match:
+        return None
+    if match.group(1) == "Z":
+        return timezone.utc
+    sign, hours, minutes = match.group(2), int(match.group(3)), int(match.group(4))
+    if hours > 23 or minutes > 59:
+        return None
+    delta = timedelta(hours=hours, minutes=minutes)
+    return timezone(-delta if sign == "-" else delta)
+
+
 def select_capture_date(metadata: Mapping[str, Any]) -> Optional[Tuple[str, datetime]]:
     """
     Pick the capture date of a file, following the ``DATE_TAGS`` priority.
+
+    A zone-less date receives the UTC offset of its companion tag
+    (``DATE_OFFSET_TAGS``, e.g. ``OffsetTimeOriginal``) when that tag is valid.
 
     :param metadata: Tags returned by ExifTool for the file.
     :return: Tuple ``(tag_name, date)``, or ``None`` when no tag holds a valid date.
     """
     for tag in DATE_TAGS:
         date = parse_exif_datetime(metadata.get(tag))
-        if date is not None:
-            return tag, date
+        if date is None:
+            continue
+        if date.tzinfo is None and tag in DATE_OFFSET_TAGS:
+            tzinfo = parse_utc_offset(metadata.get(DATE_OFFSET_TAGS[tag]))
+            if tzinfo is not None:
+                date = date.replace(tzinfo=tzinfo)
+        return tag, date
     return None
+
+
+def apply_offset(date: datetime, offset: str) -> datetime:
+    """
+    Correct a camera clock with a signed ``HH:MM:SS`` offset.
+
+    Only the computed date changes; the file's metadata is never written.
+
+    :param date: Date read from the metadata (naive or aware).
+    :param offset: Signed offset such as ``"-01:00:00"``.
+    :return: The corrected date, with the same time zone information as ``date``.
+    :raises ValueError: If the offset is invalid or moves the date out of the supported range.
+    """
+    seconds = parse_offset(offset)
+    try:
+        return date + timedelta(seconds=seconds)
+    except OverflowError:
+        raise ValueError("offset {} moves the date {} out of range".format(offset, date.isoformat(sep=" ")))
+
+
+def load_zone(name: str) -> Any:
+    """
+    Load an IANA time zone from the time zone database.
+
+    :param name: Zone name, e.g. ``"Europe/Paris"``.
+    :return: The ``zoneinfo.ZoneInfo`` object.
+    :raises ValueError: If no time zone database is available or the zone is unknown.
+    """
+    if zoneinfo is None:
+        raise ValueError("time zone {!r} cannot be used: Python 3.9+ is required".format(name))
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        raise ValueError(
+            "time zone {!r} not found in the time zone database "
+            "(on Windows, install the 'tzdata' package)".format(name)
+        )
+
+
+def check_cli_timezone(name: str) -> Optional[str]:
+    """
+    Validate the ``--tz`` value: IANA syntax, then loading from the time zone database.
+
+    :param name: Value of ``--tz``.
+    :return: An error message, or ``None`` when the zone can be used.
+    """
+    error = validate_timezone(name)
+    if error is None:
+        try:
+            load_zone(name)
+        except ValueError as load_error:
+            error = str(load_error)
+    return error
+
+
+def classify_local_time(local: datetime, zone: Any) -> str:
+    """
+    Tell whether a wall-clock time exists exactly once in a time zone.
+
+    Around daylight saving time changes, a local time may occur twice
+    (clocks set back) or never (clocks set forward).
+
+    :param local: Naive local date and time.
+    :param zone: Time zone object (``tzinfo``).
+    :return: ``LOCAL_TIME_VALID``, ``LOCAL_TIME_AMBIGUOUS`` or ``LOCAL_TIME_NONEXISTENT``.
+    """
+    first = local.replace(tzinfo=zone, fold=0)
+    second = local.replace(tzinfo=zone, fold=1)
+    if first.utcoffset() == second.utcoffset():
+        return LOCAL_TIME_VALID
+    round_trip = first.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None)
+    return LOCAL_TIME_AMBIGUOUS if round_trip == local else LOCAL_TIME_NONEXISTENT
+
+
+def choose_zone(device: Mapping[str, Any], cli_tz: Optional[str]) -> Tuple[str, str]:
+    """
+    Choose the reference time zone of a zone-less date.
+
+    ``--tz`` (explicit batch policy) wins over the device's ``timezone``.
+
+    :param device: Device entry of the file.
+    :param cli_tz: Value of ``--tz``, if any.
+    :return: Tuple ``(zone_name, zone_source)``; both empty when no zone is known.
+    """
+    if cli_tz:
+        return cli_tz, ZONE_SOURCE_CLI
+    if device.get("timezone"):
+        return device["timezone"], ZONE_SOURCE_DEVICE
+    return "", ""
+
+
+def compute_effective_date(
+    date: datetime, device: Mapping[str, Any], cli_tz: Optional[str] = None
+) -> EffectiveDate:
+    """
+    Compute the date used in file names.
+
+    The device clock offset is applied first. The result is then normalized
+    to UTC only when its zone is known: offset stored in the metadata, then
+    ``--tz``, then the device time zone. Otherwise, the naive local time is
+    kept. Ambiguous or non-existent local times (daylight saving time changes)
+    and unavailable zones are not converted: the local time is kept and a
+    warning is returned.
+
+    :param date: Capture date read from the metadata (naive or aware).
+    :param device: Device entry of the file (``offset`` and optional ``timezone``).
+    :param cli_tz: Value of ``--tz``, if any.
+    :return: Effective date: an aware UTC date, or a naive local date.
+    :raises ValueError: If the offset moves the date out of the supported range.
+    """
+    corrected = apply_offset(date, device.get("offset", DEFAULT_OFFSET))
+    if corrected.tzinfo is not None:
+        return EffectiveDate(corrected.astimezone(timezone.utc), corrected.strftime("%z"),
+                             ZONE_SOURCE_METADATA, ())
+    zone_name, zone_source = choose_zone(device, cli_tz)
+    if not zone_name:
+        return EffectiveDate(corrected, "", "", ())
+    try:
+        zone = load_zone(zone_name)
+    except ValueError as error:
+        return EffectiveDate(corrected, "", "", ("{}; local time kept".format(error),))
+    kind = classify_local_time(corrected, zone)
+    if kind != LOCAL_TIME_VALID:
+        reason = ("occurs twice (clocks set back)" if kind == LOCAL_TIME_AMBIGUOUS
+                  else "does not exist (clocks set forward)")
+        warning = "{} {} in {}: local time kept, not converted to UTC".format(
+            corrected.isoformat(sep=" "), reason, zone_name)
+        return EffectiveDate(corrected, "", "", (warning,))
+    return EffectiveDate(corrected.replace(tzinfo=zone).astimezone(timezone.utc), zone_name, zone_source, ())
+
+
+def format_effective_date(effective: EffectiveDate) -> str:
+    """
+    Format an effective date for display.
+
+    :param effective: Effective date.
+    :return: Text such as ``"2024-01-02 03:04:05 UTC"`` or ``"2024-01-02 03:04:05 local"``.
+    """
+    suffix = "UTC" if effective.value.tzinfo is not None else "local"
+    return "{} {}".format(effective.value.replace(tzinfo=None).isoformat(sep=" "), suffix)
 
 
 def clean_text(value: Any) -> str:
@@ -1310,6 +1495,28 @@ def resolve_unknown_devices(
     return current, known
 
 
+def add_effective_dates(analyses: Sequence[FileAnalysis], cli_tz: Optional[str] = None) -> List[FileAnalysis]:
+    """
+    Compute the effective date of every ready file.
+
+    A file whose offset moves the date out of range is skipped.
+
+    :param analyses: File analyses, with every device resolved.
+    :param cli_tz: Value of ``--tz``, if any.
+    :return: Analyses with their ``effective`` field set for ready files.
+    """
+    result = []
+    for analysis in analyses:
+        if analysis.status == STATUS_READY and analysis.date is not None and analysis.device is not None:
+            try:
+                effective = compute_effective_date(analysis.date, analysis.device, cli_tz)
+                analysis = analysis._replace(effective=effective)
+            except ValueError as error:
+                analysis = analysis._replace(status=STATUS_SKIPPED, message=str(error))
+        result.append(analysis)
+    return result
+
+
 def analyze_source(
     source: Path,
     extensions: Iterable[str],
@@ -1322,9 +1529,11 @@ def analyze_source(
     interactive: bool = False,
     input_func: Callable[[str], str] = input,
     out: Optional[TextIO] = None,
+    cli_tz: Optional[str] = None,
 ) -> List[FileAnalysis]:
     """
-    Discover the files of a source folder, read their metadata and identify their devices.
+    Discover the files of a source folder, read their metadata, identify their devices
+    and compute their effective dates.
 
     Source files are only read. Unknown devices are resolved before returning.
 
@@ -1339,6 +1548,7 @@ def analyze_source(
     :param interactive: Whether unknown devices can be asked to the user.
     :param input_func: Function reading one line, such as ``input``.
     :param out: Stream for messages; ``sys.stdout`` when ``None``.
+    :param cli_tz: Value of ``--tz``, if any.
     :return: One analysis per discovered file, in discovery order.
     :raises NotADirectoryError: If ``source`` is not an existing folder.
     :raises ExifToolError: If ExifTool cannot be started.
@@ -1354,23 +1564,47 @@ def analyze_source(
         for relative, path in zip(relatives, absolute)
     ]
     analyses, _ = resolve_unknown_devices(analyses, devices, devices_path, interactive, input_func, out)
-    return analyses
+    return add_effective_dates(analyses, cli_tz)
+
+
+def describe_date_source(analysis: FileAnalysis) -> str:
+    """
+    Describe where the effective date of a ready file comes from.
+
+    :param analysis: Analysis of a ready file.
+    :return: Text such as ``"DateTimeOriginal 2024-01-02 03:04:05, offset -01:00:00, zone Europe/Paris (--tz)"``.
+    """
+    parts = ["{} {}".format(analysis.date_tag, analysis.date.isoformat(sep=" ") if analysis.date else "?")]
+    offset = (analysis.device or {}).get("offset", DEFAULT_OFFSET)
+    if parse_offset(offset) != 0:
+        parts.append("offset {}".format(offset))
+    effective = analysis.effective
+    if effective is not None and effective.zone:
+        parts.append("zone {} ({})".format(effective.zone, effective.zone_source))
+    return ", ".join(parts)
 
 
 def print_analysis(analyses: Sequence[FileAnalysis], out: TextIO) -> None:
     """
-    Print the analysis of every file and a summary (serial numbers are never shown).
+    Print the analysis of every file, its warnings and a summary (serial numbers are never shown).
 
     :param analyses: File analyses.
     :param out: Output stream.
     """
+    warnings = 0
     for analysis in analyses:
         name = analysis.relative.as_posix()
         if analysis.status == STATUS_READY:
             device = analysis.device or {}
-            print("[OK]   {}  {} ({})  device '{}'".format(
-                name, analysis.date.isoformat(sep=" ") if analysis.date else "?",
-                analysis.date_tag, device.get("label", "?")), file=out)
+            if analysis.effective is not None:
+                shown = format_effective_date(analysis.effective)
+            else:
+                shown = analysis.date.isoformat(sep=" ") if analysis.date else "?"
+            print("[OK]   {}  {}  device '{}'  ({})".format(
+                name, shown, device.get("label", "?"), describe_date_source(analysis)), file=out)
+            for warning in analysis.effective.warnings if analysis.effective else ():
+                print("       warning: {}".format(warning), file=out)
+                warnings += 1
         elif analysis.status == STATUS_AUXILIARY:
             print("[AUX]  {}  {}".format(name, analysis.message), file=out)
         else:
@@ -1378,9 +1612,9 @@ def print_analysis(analyses: Sequence[FileAnalysis], out: TextIO) -> None:
     counts = {}  # type: Dict[str, int]
     for analysis in analyses:
         counts[analysis.status] = counts.get(analysis.status, 0) + 1
-    print("{} file(s): {} ready, {} auxiliary, {} skipped.".format(
+    print("{} file(s): {} ready, {} auxiliary, {} skipped, {} warning(s).".format(
         len(analyses), counts.get(STATUS_READY, 0), counts.get(STATUS_AUXILIARY, 0),
-        len(analyses) - counts.get(STATUS_READY, 0) - counts.get(STATUS_AUXILIARY, 0)), file=out)
+        len(analyses) - counts.get(STATUS_READY, 0) - counts.get(STATUS_AUXILIARY, 0), warnings), file=out)
 
 
 def run_check(
@@ -1420,7 +1654,7 @@ def run_check(
         print("[ERROR] Devices: {}".format(error), file=err)
         failed = True
     if timezone is not None:
-        tz_error = validate_timezone(timezone)
+        tz_error = check_cli_timezone(timezone)
         if tz_error:
             print("[ERROR] --tz: {}".format(tz_error), file=err)
             failed = True
@@ -1473,9 +1707,11 @@ def main(
     except ConfigError as error:
         print("[ERROR] {}".format(error), file=sys.stderr)
         return 1
-    if args.tz is not None and validate_timezone(args.tz):
-        print("[ERROR] --tz: {}".format(validate_timezone(args.tz)), file=sys.stderr)
-        return 1
+    if args.tz is not None:
+        tz_error = check_cli_timezone(args.tz)
+        if tz_error:
+            print("[ERROR] --tz: {}".format(tz_error), file=sys.stderr)
+            return 1
     forced_device = None
     if args.device is not None:
         forced_device = find_device(devices, args.device)
@@ -1492,7 +1728,7 @@ def main(
         executable = find_exiftool(root / BIN_DIR_NAME, environ)
         analyses = analyze_source(
             source, config["supported_extensions"], devices, conf_dir / DEVICES_FILE_NAME, executable,
-            args.recursive, forced_device, excluded, is_interactive, input_func,
+            args.recursive, forced_device, excluded, is_interactive, input_func, cli_tz=args.tz,
         )
     except (ConfigError, ExifToolError, UnknownDeviceError) as error:
         print("[ERROR] {}".format(error), file=sys.stderr)

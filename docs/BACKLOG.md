@@ -61,10 +61,10 @@ Goal: compute the effective date used in names.
 - **3.4 Date source documentation** — Document the chosen tags and the limits of zone-less metadata.
 
 ### Done — Epic 3
-- [ ] Tests: positive/negative offsets, day/month/year rollover, leap day.
-- [ ] Tests: known zone, `--tz`, no zone; DST ambiguous and gap cases produce warnings.
-- [ ] Original files' metadata verified unchanged after a run.
-- [ ] Documentation section on date sources and limitations written.
+- [x] Tests: positive/negative offsets, day/month/year rollover, leap day.
+- [x] Tests: known zone, `--tz`, no zone; DST ambiguous and gap cases produce warnings.
+- [x] Original files' metadata verified unchanged after a run.
+- [x] Documentation section on date sources and limitations written.
 
 ---
 
