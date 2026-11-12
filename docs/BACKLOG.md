@@ -23,12 +23,12 @@ Goal: load and validate `conf/config.json` / `conf/devices.json`, locate ExifToo
 - **1.6 `--check`** — Validate configuration and print ExifTool version and location; non-zero exit on failure.
 
 ### Done — Epic 1
-- [ ] `uv run python media_renamer.py --help` lists every option of the plan.
-- [ ] `conf/config.json` and `conf/devices.json` are git-ignored; the `*.default.json` templates are tracked.
-- [ ] On first run with missing personal files, they are created from the templates; existing files are left untouched (tested).
-- [ ] `--check` succeeds with the default `conf/config.json`, empty `conf/devices.json` and ExifTool installed.
-- [ ] `--check` fails with an explicit message for: invalid JSON, unknown token, bad offset, duplicate device id, missing ExifTool.
-- [ ] Unit tests cover each validation rule (valid and invalid cases).
+- [x] `uv run python media_renamer.py --help` lists every option of the plan.
+- [x] `conf/config.json` and `conf/devices.json` are git-ignored; the `*.default.json` templates are tracked.
+- [x] On first run with missing personal files, they are created from the templates; existing files are left untouched (tested).
+- [x] `--check` succeeds with the default `conf/config.json`, empty `conf/devices.json` and ExifTool installed.
+- [x] `--check` fails with an explicit message for: invalid JSON, unknown token, bad offset, duplicate device id, missing ExifTool.
+- [x] Unit tests cover each validation rule (valid and invalid cases).
 
 ---
 
@@ -43,11 +43,11 @@ Goal: read metadata through ExifTool and match each file to a device.
 - **2.5 Unknown device handling** — Interactive prompt for label and offset, saved to `conf/devices.json`, reused for all matching files of the batch; resolved before any file modification; clear error in non-interactive mode.
 
 ### Done — Epic 2
-- [ ] On a sample folder, discovery returns the expected files (flat and recursive, nested subfolders, relative paths preserved).
-- [ ] Metadata extracted from real JPG, MP4 and RAW samples; missing-date file reported and skipped.
-- [ ] Matching tests: case-insensitivity, serial optional, first match wins, `--device` override.
-- [ ] Unknown device: answer persisted in `conf/devices.json`, no second prompt for the same device, non-interactive run exits with a clear error.
-- [ ] No source file is modified during this epic.
+- [x] On a sample folder, discovery returns the expected files (flat and recursive, nested subfolders, relative paths preserved).
+- [x] Metadata extracted from real JPG, MP4 and RAW samples; missing-date file reported and skipped.
+- [x] Matching tests: case-insensitivity, serial optional, first match wins, `--device` override.
+- [x] Unknown device: answer persisted in `conf/devices.json`, no second prompt for the same device, non-interactive run exits with a clear error.
+- [x] No source file is modified during this epic.
 
 ---
 
@@ -61,10 +61,10 @@ Goal: compute the effective date used in names.
 - **3.4 Date source documentation** — Document the chosen tags and the limits of zone-less metadata.
 
 ### Done — Epic 3
-- [ ] Tests: positive/negative offsets, day/month/year rollover, leap day.
-- [ ] Tests: known zone, `--tz`, no zone; DST ambiguous and gap cases produce warnings.
-- [ ] Original files' metadata verified unchanged after a run.
-- [ ] Documentation section on date sources and limitations written.
+- [x] Tests: positive/negative offsets, day/month/year rollover, leap day.
+- [x] Tests: known zone, `--tz`, no zone; DST ambiguous and gap cases produce warnings.
+- [x] Original files' metadata verified unchanged after a run.
+- [x] Documentation section on date sources and limitations written.
 
 ---
 
@@ -73,16 +73,17 @@ Goal: compute the effective date used in names.
 Goal: build the target names once, shared by preview and apply.
 
 - **4.1 Name builder** — Render the pattern tokens, sanitize invalid characters deterministically.
-- **4.2 GoPro auxiliary files** — Link `.LRV` / `.THM` to the main video with the same base name in the same folder; reuse its date and device, keep extension; warn and skip if the main file is absent from that folder.
+- **4.2 GoPro auxiliary files** — Link `.LRV` / `.THM` (and `.WAV` "RAW audio" files named with a GoPro file id) to the main video with the same base name in the same folder, or else with the same GoPro file id ending the name (`GH011892`, `GL011892`, `GOPR2098`…), so names prefixed by another tool still match; reuse its date and device, keep extension; warn and skip if the main file is absent from that folder.
 - **4.3 Collision resolution** — Unique targets with `_01`, `_02`… before the extension, resolved per target directory; account for existing files and case-insensitive file systems.
 - **4.4 Plan model** — Immutable plan entries (source, target, action, warnings) produced by a single function.
 
 ### Done — Epic 4
-- [ ] Same input always yields the same plan (determinism test).
-- [ ] Tests: collisions inside the batch, with existing files, case-only differences.
-- [ ] Tests: `.LRV`/`.THM` follow the main video; orphan auxiliary is warned and not renamed.
-- [ ] Tests: same base name in two different subfolders yields no cross-folder pairing and no cross-folder collision suffix.
-- [ ] Plan generation touches no file.
+- [x] Same input always yields the same plan (determinism test).
+- [x] Tests: collisions inside the batch, with existing files, case-only differences.
+- [x] Tests: `.LRV`/`.THM` follow the main video; orphan auxiliary is warned and not renamed.
+- [x] Tests: auxiliary files and GoPro `.WAV` follow their main video by GoPro file id when prefixes differ.
+- [x] Tests: same base name in two different subfolders yields no cross-folder pairing and no cross-folder collision suffix.
+- [x] Plan generation touches no file.
 
 ---
 
@@ -94,14 +95,14 @@ Goal: execute the plan safely.
 - **5.2 In-place rename** — With `--apply` and no `--dest`, rename sources; each file stays in its own subfolder.
 - **5.3 Copy to destination** — With `--dest`, copy under the computed name and leave sources intact; create the destination if needed. With `--recursive`, recreate the original relative tree under the destination, creating only directories that receive at least one file (no empty directories, also in preview).
 - **5.4 Overwrite protection** — Never overwrite an existing file; fail or skip with a clear message.
-- **5.5 Config default** — Honor `dry_run_by_default` from `conf/config.json`.
+- **5.5 Config default** — Honor `dry_run_by_default` from `conf/config.json`; `--apply` forces execution and `--dry-run` forces a preview (mutually exclusive).
 
 ### Done — Epic 5
-- [ ] Preview and apply produce identical target names (same plan function).
-- [ ] Integration test with `tmp_path`: in-place rename, copy with sources intact, no overwrite.
-- [ ] Integration test with `tmp_path` and `--recursive`: in-place rename keeps subfolders; copy to `--dest` recreates the source tree and creates no empty directory (including subfolders with no supported file).
-- [ ] Unknown devices are resolved before the first file operation.
-- [ ] Manual run on a real sample folder gives the expected result.
+- [x] Preview and apply produce identical target names (same plan function).
+- [x] Integration test with `tmp_path`: in-place rename, copy with sources intact, no overwrite.
+- [x] Integration test with `tmp_path` and `--recursive`: in-place rename keeps subfolders; copy to `--dest` recreates the source tree and creates no empty directory (including subfolders with no supported file).
+- [x] Unknown devices are resolved before the first file operation.
+- [x] Manual run on a real sample folder gives the expected result.
 
 ---
 
@@ -114,9 +115,9 @@ Goal: clear run summary and a safe log.
 - **6.3 Privacy** — Do not expose unnecessary personal metadata (GPS, serial numbers, etc.) in output or log.
 
 ### Done — Epic 6
-- [ ] Summary matches the actual operations in an integration test.
-- [ ] `.logs/rename.log` created, `.logs/` stays git-ignored.
-- [ ] Test asserting no GPS/serial values appear in logs.
+- [x] Summary matches the actual operations in an integration test.
+- [x] `.logs/rename.log` created, `.logs/` stays git-ignored.
+- [x] Test asserting no GPS/serial values appear in logs.
 
 ---
 
@@ -130,10 +131,10 @@ Goal: maintainable, English documentation.
 - **7.3 Licensing** — Keep `LICENSE` (MIT) and `THIRD-PARTY-NOTICES` accurate.
 
 ### Done — Epic 7
-- [ ] A new user can install and run a preview following only the README.
-- [ ] The README tells the user to back up `conf/config.json` and `conf/devices.json`.
-- [ ] Each troubleshooting topic of the plan is covered.
-- [ ] Licensing statement consistent with the plan (MIT for original code, ExifTool under its own license).
+- [x] A new user can install and run a preview following only the README.
+- [x] The README tells the user to back up `conf/config.json` and `conf/devices.json`.
+- [x] Each troubleshooting topic of the plan is covered.
+- [x] Licensing statement consistent with the plan (MIT for original code, ExifTool under its own license).
 
 ---
 
@@ -147,6 +148,6 @@ Goal: validate error cases and platforms.
 - **8.4 Coverage check** — Verify every function has a unit test.
 
 ### Done — Epic 8
-- [ ] `uv run pytest` is green on Windows and one POSIX system.
-- [ ] Every function in `media_renamer.py` has at least one test.
-- [ ] End-to-end run on a mixed sample (photos, videos, GoPro files, unknown device) validated manually.
+- [x] `uv run pytest` is green on Windows and one POSIX system (locally on Windows; in CI on Ubuntu, macOS and Windows via `.github/workflows/tests.yml`).
+- [x] Every function in `media_renamer.py` has at least one test (enforced by `test_every_function_has_a_test`).
+- [x] End-to-end run on a mixed sample (photos, videos, GoPro files, unknown device) validated manually.
