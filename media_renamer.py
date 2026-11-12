@@ -8,8 +8,23 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Set, TextIO
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    TextIO,
+    Tuple,
+    Union,
+)
 
 try:
     import zoneinfo
@@ -43,6 +58,29 @@ TIMEZONE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+)*$")
 EXIFTOOL_ENV_VAR = "EXIFTOOL_PATH"
 EXIFTOOL_KEEP_OPEN_GLOB = "exiftool(-k)*"
 EXIFTOOL_TIMEOUT_SECONDS = 30
+EXIFTOOL_SECONDS_PER_FILE = 5
+EXIFTOOL_BATCH_SIZE = 100
+
+LOGS_DIR_NAME = ".logs"
+AUXILIARY_EXTENSIONS = (".lrv", ".thm")
+
+# Capture date tags, by decreasing priority. The first one holding a valid date
+# wins. File system dates (FileModifyDate...) are never used.
+DATE_TAGS = ("DateTimeOriginal", "CreateDate", "MediaCreateDate", "TrackCreateDate")
+IDENTITY_TAGS = ("Make", "Model", "SerialNumber")
+# Only these tags are requested from ExifTool, so GPS and other personal data
+# never enter the program.
+METADATA_TAGS = DATE_TAGS + IDENTITY_TAGS + ("Error",)
+EXIF_DATE_RE = re.compile(
+    r"^(\d{4})[:-](\d{2})[:-](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?"
+    r"\s*(Z|[+-]\d{2}:?\d{2})?$"
+)
+
+STATUS_READY = "ready"
+STATUS_AUXILIARY = "auxiliary"
+STATUS_SKIPPED = "skipped"
+STATUS_UNKNOWN_DEVICE = "unknown_device"
+DEFAULT_OFFSET = "+00:00:00"
 
 
 class ConfigError(Exception):
@@ -51,6 +89,30 @@ class ConfigError(Exception):
 
 class ExifToolError(Exception):
     """Raised when ExifTool cannot be found or does not run correctly."""
+
+
+class UnknownDeviceError(Exception):
+    """Raised when unknown devices cannot be registered (non-interactive run)."""
+
+
+class DeviceIdentity(NamedTuple):
+    """Camera identification read from a file's metadata (empty string when absent)."""
+
+    make: str
+    model: str
+    serial_number: str
+
+
+class FileAnalysis(NamedTuple):
+    """Result of analyzing one discovered file."""
+
+    relative: Path
+    status: str
+    message: str
+    date_tag: str
+    date: Optional[datetime]
+    identity: DeviceIdentity
+    device: Optional[Dict[str, Any]]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -633,6 +695,694 @@ def get_exiftool_version(executable: Path, timeout: float = EXIFTOOL_TIMEOUT_SEC
     return version
 
 
+def path_key(path: Union[str, Path]) -> str:
+    """
+    Build a comparison key for a path, following the platform's case rules.
+
+    :param path: Path to normalize.
+    :return: Normalized path (lower-cased with backslashes on Windows).
+    """
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def discover_files(
+    source: Path,
+    extensions: Iterable[str],
+    recursive: bool = False,
+    excluded_dirs: Iterable[Path] = (),
+) -> List[Path]:
+    """
+    List the media files of a source folder.
+
+    Extensions are compared case-insensitively. Folders named ``.logs`` and the
+    ``excluded_dirs`` (e.g. a destination inside the source) are never scanned.
+    Symbolic links to folders are not followed.
+
+    :param source: Source folder.
+    :param extensions: Accepted extensions, such as ``".jpg"``.
+    :param recursive: Also scan every subfolder when ``True``.
+    :param excluded_dirs: Folders to skip, with their content.
+    :return: Paths relative to ``source``, sorted case-insensitively.
+    :raises NotADirectoryError: If ``source`` is not an existing folder.
+    """
+    if not source.is_dir():
+        raise NotADirectoryError("source folder not found: {}".format(source))
+    root = source.resolve()
+    wanted = {extension.lower() for extension in extensions}
+    excluded = {path_key(Path(folder).resolve()) for folder in excluded_dirs}
+    found = []
+    for current, dirnames, filenames in os.walk(str(root)):
+        current_path = Path(current)
+        if recursive:
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if name.casefold() != LOGS_DIR_NAME and path_key(current_path / name) not in excluded
+            )
+        else:
+            dirnames[:] = []
+        for name in filenames:
+            if os.path.splitext(name)[1].lower() in wanted and (current_path / name).is_file():
+                found.append((current_path / name).relative_to(root))
+    return sorted(found, key=lambda path: (path.as_posix().casefold(), path.as_posix()))
+
+
+def build_exiftool_command(executable: Path, argfile: Path) -> List[str]:
+    """
+    Build the ExifTool command reading the file list from an argument file.
+
+    Output is JSON, restricted to ``METADATA_TAGS``; file names are exchanged in UTF-8.
+
+    :param executable: Path of the ExifTool executable.
+    :param argfile: UTF-8 file listing one absolute file path per line.
+    :return: Command line, ready for ``subprocess.run``.
+    """
+    command = [str(executable), "-json", "-q", "-charset", "filename=utf8", "-api", "LargeFileSupport=1"]
+    command.extend("-" + tag for tag in METADATA_TAGS)
+    command.extend(["-@", str(argfile)])
+    return command
+
+
+def find_stderr_message(stderr_lines: Sequence[str], path: Path) -> Optional[str]:
+    """
+    Find the ExifTool error message about a file.
+
+    ExifTool reports problems as ``"Error: <message> - <file>"``.
+
+    :param stderr_lines: Lines printed by ExifTool on its error stream.
+    :param path: File the message must refer to.
+    :return: The message without the file name, or ``None`` when absent.
+    """
+    suffix = os.path.normcase(" - " + path.as_posix())
+    for line in stderr_lines:
+        if os.path.normcase(line).endswith(suffix):
+            return line[: len(line) - len(suffix)].strip()
+    return None
+
+
+def parse_exiftool_output(
+    stdout: str, stderr: str, paths: Sequence[Path]
+) -> Tuple[Dict[Path, Dict[str, Any]], Dict[Path, str]]:
+    """
+    Split ExifTool JSON output into per-file metadata and per-file errors.
+
+    Every requested path ends up in exactly one of the two results.
+
+    :param stdout: JSON printed by ExifTool.
+    :param stderr: Error stream printed by ExifTool.
+    :param paths: Files that were passed to ExifTool.
+    :return: Tuple ``(metadata, errors)``, both keyed by the given paths.
+    """
+    expected = {path_key(path): path for path in paths}
+    metadata = {}  # type: Dict[Path, Dict[str, Any]]
+    errors = {}  # type: Dict[Path, str]
+    records = []  # type: List[Any]
+    if stdout.strip():
+        try:
+            records = json.loads(stdout)
+        except json.JSONDecodeError:
+            return {}, {path: "unreadable ExifTool output" for path in paths}
+        if not isinstance(records, list):
+            return {}, {path: "unexpected ExifTool output" for path in paths}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        path = expected.get(path_key(record.get("SourceFile", "")))
+        if path is None:
+            continue
+        if record.get("Error"):
+            errors[path] = str(record["Error"])
+        else:
+            metadata[path] = record
+    stderr_lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    for path in paths:
+        if path not in metadata and path not in errors:
+            errors[path] = find_stderr_message(stderr_lines, path) or "no metadata returned by ExifTool"
+    return metadata, errors
+
+
+def run_exiftool_batch(
+    executable: Path, paths: Sequence[Path], timeout: float
+) -> Tuple[Dict[Path, Dict[str, Any]], Dict[Path, str]]:
+    """
+    Read the metadata of a batch of files with a single ExifTool call.
+
+    A timeout marks every file of the batch as failed instead of stopping the run.
+
+    :param executable: Path of the ExifTool executable.
+    :param paths: Absolute paths of the files to read.
+    :param timeout: Maximum run time in seconds.
+    :return: Tuple ``(metadata, errors)``, both keyed by the given paths.
+    :raises ExifToolError: If ExifTool cannot be started.
+    """
+    descriptor, argfile = tempfile.mkstemp(prefix="media_renamer_", suffix=".args")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            for path in paths:
+                handle.write(path.as_posix() + "\n")
+        try:
+            result = subprocess.run(
+                build_exiftool_command(executable, Path(argfile)),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            message = "ExifTool gave no answer after {} seconds".format(timeout)
+            return {}, {path: message for path in paths}
+        except OSError as error:
+            raise ExifToolError("{}: cannot be started ({})".format(executable, error))
+    finally:
+        os.remove(argfile)
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    return parse_exiftool_output(stdout, stderr, paths)
+
+
+def read_metadata(
+    executable: Path, paths: Sequence[Path], batch_size: int = EXIFTOOL_BATCH_SIZE
+) -> Tuple[Dict[Path, Dict[str, Any]], Dict[Path, str]]:
+    """
+    Read the metadata of many files, calling ExifTool once per batch.
+
+    The timeout of each call grows with the batch size.
+
+    :param executable: Path of the ExifTool executable.
+    :param paths: Absolute paths of the files to read.
+    :param batch_size: Maximum number of files per ExifTool call.
+    :return: Tuple ``(metadata, errors)``, both keyed by the given paths.
+    :raises ExifToolError: If ExifTool cannot be started.
+    """
+    metadata = {}  # type: Dict[Path, Dict[str, Any]]
+    errors = {}  # type: Dict[Path, str]
+    for start in range(0, len(paths), batch_size):
+        batch = paths[start:start + batch_size]
+        timeout = EXIFTOOL_TIMEOUT_SECONDS + EXIFTOOL_SECONDS_PER_FILE * len(batch)
+        batch_metadata, batch_errors = run_exiftool_batch(executable, batch, timeout)
+        metadata.update(batch_metadata)
+        errors.update(batch_errors)
+    return metadata, errors
+
+
+def parse_exif_datetime(value: Any) -> Optional[datetime]:
+    """
+    Parse an ExifTool date such as ``"2024:07:14 17:19:24"``.
+
+    Sub-seconds are dropped and missing seconds count as 0. A trailing UTC
+    offset (``"Z"``, ``"+02:00"``) yields an aware datetime, otherwise the
+    result is naive. Zero or impossible dates are rejected.
+
+    :param value: Tag value returned by ExifTool.
+    :return: The parsed date, or ``None`` when the value is not a valid date.
+    """
+    if not isinstance(value, str):
+        return None
+    match = EXIF_DATE_RE.match(value.strip())
+    if not match:
+        return None
+    year, month, day, hour, minute, second, zone = match.groups()
+    try:
+        tzinfo = None
+        if zone == "Z":
+            tzinfo = timezone.utc
+        elif zone:
+            digits = zone[1:].replace(":", "")
+            delta = timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+            tzinfo = timezone(-delta if zone[0] == "-" else delta)
+        return datetime(
+            int(year), int(month), int(day), int(hour), int(minute), int(second or 0), tzinfo=tzinfo
+        )
+    except ValueError:
+        return None
+
+
+def select_capture_date(metadata: Mapping[str, Any]) -> Optional[Tuple[str, datetime]]:
+    """
+    Pick the capture date of a file, following the ``DATE_TAGS`` priority.
+
+    :param metadata: Tags returned by ExifTool for the file.
+    :return: Tuple ``(tag_name, date)``, or ``None`` when no tag holds a valid date.
+    """
+    for tag in DATE_TAGS:
+        date = parse_exif_datetime(metadata.get(tag))
+        if date is not None:
+            return tag, date
+    return None
+
+
+def clean_text(value: Any) -> str:
+    """
+    Convert a metadata value to a trimmed string.
+
+    :param value: Tag value (ExifTool may return numbers).
+    :return: Trimmed text; empty for ``None``.
+    """
+    return "" if value is None else str(value).strip()
+
+
+def normalize_text(value: str) -> str:
+    """
+    Normalize a text for case-insensitive comparison.
+
+    :param value: Text to normalize.
+    :return: Case-folded text with collapsed white space.
+    """
+    return " ".join(value.split()).casefold()
+
+
+def extract_identity(metadata: Mapping[str, Any]) -> DeviceIdentity:
+    """
+    Read the camera identification of a file.
+
+    :param metadata: Tags returned by ExifTool for the file.
+    :return: Make, model and serial number (empty when absent).
+    """
+    return DeviceIdentity(
+        clean_text(metadata.get("Make")),
+        clean_text(metadata.get("Model")),
+        clean_text(metadata.get("SerialNumber")),
+    )
+
+
+def device_matches(device: Mapping[str, Any], identity: DeviceIdentity) -> bool:
+    """
+    Tell whether a device entry matches a file's identification.
+
+    Comparison is case-insensitive. Empty criteria of the entry are ignored.
+    A ``model`` criterion must always match; ``make`` and ``serial_number``
+    are only compared when the file provides them (many video containers,
+    such as GoPro MP4 files, have a model but no make or serial number).
+
+    :param device: Validated device entry.
+    :param identity: Identification read from the file.
+    :return: ``True`` when every applicable criterion matches and at least one was compared.
+    """
+    criteria = device["match"]
+    actual_values = {"make": identity.make, "model": identity.model, "serial_number": identity.serial_number}
+    compared = False
+    for key in MATCH_KEYS:
+        expected = normalize_text(criteria.get(key, ""))
+        if not expected:
+            continue
+        actual = normalize_text(actual_values[key])
+        if not actual:
+            if key == "model":
+                return False
+            continue
+        if actual != expected:
+            return False
+        compared = True
+    return compared
+
+
+def match_device(devices: Sequence[Dict[str, Any]], identity: DeviceIdentity) -> Optional[Dict[str, Any]]:
+    """
+    Find the first device entry matching a file's identification.
+
+    :param devices: Validated device entries, in file order.
+    :param identity: Identification read from the file.
+    :return: The first matching entry, or ``None``.
+    """
+    for device in devices:
+        if device_matches(device, identity):
+            return device
+    return None
+
+
+def analyze_file(
+    relative: Path,
+    metadata: Optional[Mapping[str, Any]],
+    error: Optional[str],
+    devices: Sequence[Dict[str, Any]],
+    forced_device: Optional[Dict[str, Any]] = None,
+) -> FileAnalysis:
+    """
+    Decide the capture date and device of one file.
+
+    GoPro auxiliary files (``.LRV``, ``.THM``) are only flagged: they take the
+    date and device of their main video later. Files without readable metadata,
+    without a valid capture date or without any make/model are skipped; the
+    system date is never used.
+
+    :param relative: File path relative to the source folder.
+    :param metadata: Tags returned by ExifTool, or ``None`` when reading failed.
+    :param error: ExifTool error message for this file, if any.
+    :param devices: Validated device entries.
+    :param forced_device: Device imposed with ``--device``, if any.
+    :return: Analysis of the file.
+    """
+    empty_identity = DeviceIdentity("", "", "")
+    if relative.suffix.lower() in AUXILIARY_EXTENSIONS:
+        return FileAnalysis(relative, STATUS_AUXILIARY, "follows its main video", "", None, empty_identity, None)
+    if metadata is None:
+        message = "unreadable metadata ({})".format(error or "unknown error")
+        return FileAnalysis(relative, STATUS_SKIPPED, message, "", None, empty_identity, None)
+    identity = extract_identity(metadata)
+    selected = select_capture_date(metadata)
+    if selected is None:
+        message = "no valid capture date (checked {})".format(", ".join(DATE_TAGS))
+        return FileAnalysis(relative, STATUS_SKIPPED, message, "", None, identity, None)
+    date_tag, date = selected
+    device = forced_device or match_device(devices, identity)
+    if device is not None:
+        return FileAnalysis(relative, STATUS_READY, "", date_tag, date, identity, device)
+    if not identity.make and not identity.model:
+        message = "no Make/Model metadata to identify the device (use --device)"
+        return FileAnalysis(relative, STATUS_SKIPPED, message, date_tag, date, identity, None)
+    return FileAnalysis(relative, STATUS_UNKNOWN_DEVICE, "", date_tag, date, identity, None)
+
+
+def collect_unknown_identities(analyses: Iterable[FileAnalysis]) -> List[DeviceIdentity]:
+    """
+    List the distinct identifications of files with an unknown device.
+
+    :param analyses: File analyses.
+    :return: Identifications, in order of first appearance.
+    """
+    found = []  # type: List[DeviceIdentity]
+    for analysis in analyses:
+        if analysis.status == STATUS_UNKNOWN_DEVICE and analysis.identity not in found:
+            found.append(analysis.identity)
+    return found
+
+
+def mask_serial(serial: str) -> str:
+    """
+    Hide most of a serial number.
+
+    :param serial: Serial number.
+    :return: Only the last 4 characters, prefixed with ``***``; empty when no serial.
+    """
+    if not serial:
+        return ""
+    return "***" + serial[-4:] if len(serial) > 4 else "***"
+
+
+def describe_identity(identity: DeviceIdentity) -> str:
+    """
+    Describe an identification for the user, with a masked serial number.
+
+    :param identity: Identification to describe.
+    :return: Text such as ``Make 'GoPro', Model 'HERO9 Black', serial ***4391``.
+    """
+    parts = []
+    if identity.make:
+        parts.append("Make '{}'".format(identity.make))
+    if identity.model:
+        parts.append("Model '{}'".format(identity.model))
+    if identity.serial_number:
+        parts.append("serial {}".format(mask_serial(identity.serial_number)))
+    return ", ".join(parts) or "no identification"
+
+
+def make_device_id(label: str, devices: Iterable[Mapping[str, Any]]) -> str:
+    """
+    Build a unique device id from a label.
+
+    :param label: Device label chosen by the user.
+    :param devices: Existing device entries.
+    :return: Lower-case id made of letters, digits and dashes, suffixed with ``-2``, ``-3``... if taken.
+    """
+    base = re.sub(r"[^a-z0-9]+", "-", label.casefold()).strip("-") or "device"
+    taken = {device["id"].strip().lower() for device in devices}
+    candidate = base
+    counter = 2
+    while candidate in taken:
+        candidate = "{}-{}".format(base, counter)
+        counter += 1
+    return candidate
+
+
+def default_label(identity: DeviceIdentity) -> str:
+    """
+    Suggest a device label from an identification.
+
+    :param identity: Identification of the device.
+    :return: Model (or make) without invalid file name characters; ``"Device"`` as last resort.
+    """
+    text = identity.model or identity.make
+    invalid = set(find_invalid_filename_chars(text))
+    return "".join(char for char in text if char not in invalid).strip() or "Device"
+
+
+def validate_label_answer(answer: str) -> Optional[str]:
+    """
+    Validate a device label typed by the user.
+
+    :param answer: Typed label.
+    :return: An error message, or ``None`` when the label is valid.
+    """
+    if not answer:
+        return "the label must not be empty"
+    invalid = find_invalid_filename_chars(answer)
+    if invalid:
+        return "the label contains invalid file name characters: {}".format(
+            " ".join(repr(char) for char in invalid)
+        )
+    return None
+
+
+def validate_offset_answer(answer: str) -> Optional[str]:
+    """
+    Validate a clock offset typed by the user.
+
+    :param answer: Typed offset.
+    :return: An error message, or ``None`` when the offset is valid.
+    """
+    try:
+        parse_offset(answer)
+    except ValueError as error:
+        return str(error)
+    return None
+
+
+def validate_timezone_answer(answer: str) -> Optional[str]:
+    """
+    Validate an optional IANA time zone typed by the user.
+
+    :param answer: Typed zone; empty means no zone.
+    :return: An error message, or ``None`` when the answer is valid.
+    """
+    return validate_timezone(answer) if answer else None
+
+
+def validate_yes_no_answer(answer: str) -> Optional[str]:
+    """
+    Validate a yes/no answer.
+
+    :param answer: Typed answer.
+    :return: An error message, or ``None`` when the answer is ``y``, ``yes``, ``n`` or ``no``.
+    """
+    return None if answer.lower() in ("y", "yes", "n", "no") else "please answer y or n"
+
+
+def ask(
+    input_func: Callable[[str], str],
+    out: TextIO,
+    prompt: str,
+    validate: Callable[[str], Optional[str]],
+    default: str = "",
+) -> str:
+    """
+    Ask a question until the answer is valid.
+
+    :param input_func: Function reading one line, such as ``input``.
+    :param out: Stream for validation messages.
+    :param prompt: Question shown to the user.
+    :param validate: Returns an error message for an invalid answer, ``None`` otherwise.
+    :param default: Answer used when the user just presses Enter.
+    :return: The valid, trimmed answer.
+    :raises EOFError: If the input stream is closed.
+    """
+    while True:
+        answer = input_func(prompt).strip() or default
+        error = validate(answer)
+        if error is None:
+            return answer
+        print("  {}".format(error), file=out)
+
+
+def prompt_new_device(
+    identity: DeviceIdentity,
+    devices: Sequence[Mapping[str, Any]],
+    input_func: Callable[[str], str],
+    out: TextIO,
+) -> Dict[str, Any]:
+    """
+    Ask the user to describe an unknown device.
+
+    The serial number is only used as a criterion when the user asks for it,
+    so files of the same model without a serial number still match.
+
+    :param identity: Identification of the unknown device.
+    :param devices: Existing device entries, used to build a unique id.
+    :param input_func: Function reading one line, such as ``input``.
+    :param out: Stream for messages.
+    :return: New, valid device entry.
+    :raises EOFError: If the input stream is closed.
+    """
+    print("\nUnknown device: {}".format(describe_identity(identity)), file=out)
+    suggestion = default_label(identity)
+    label = ask(input_func, out, "  Label used in file names [{}]: ".format(suggestion),
+                validate_label_answer, suggestion)
+    offset = ask(input_func, out, "  Clock offset to apply, signed HH:MM:SS [{}]: ".format(DEFAULT_OFFSET),
+                 validate_offset_answer, DEFAULT_OFFSET)
+    zone = ask(input_func, out, "  IANA time zone, e.g. Europe/Paris (empty for none) []: ",
+               validate_timezone_answer)
+    use_serial = False
+    if identity.serial_number:
+        answer = ask(input_func, out, "  Match only this camera body by its serial number? [y/N]: ",
+                     validate_yes_no_answer, "n")
+        use_serial = answer.lower() in ("y", "yes")
+    match = {}  # type: Dict[str, str]
+    if identity.make:
+        match["make"] = identity.make
+    if identity.model:
+        match["model"] = identity.model
+    if use_serial:
+        match["serial_number"] = identity.serial_number
+    device = {"id": make_device_id(label, devices), "label": label, "match": match, "offset": offset}
+    if zone:
+        device["timezone"] = zone
+    return device
+
+
+def format_unknown_devices_error(identities: Sequence[DeviceIdentity]) -> str:
+    """
+    Build the error shown when unknown devices cannot be registered interactively.
+
+    :param identities: Unknown identifications.
+    :return: Multi-line message listing the devices and the ways to fix the run.
+    """
+    lines = ["{} unknown device(s) and no interactive terminal to register them:".format(len(identities))]
+    lines.extend("  - {}".format(describe_identity(identity)) for identity in identities)
+    lines.append("Run the command in a terminal to answer the questions, add the devices to "
+                 "conf/devices.json, or force a device with --device ID.")
+    return "\n".join(lines)
+
+
+def resolve_unknown_devices(
+    analyses: Sequence[FileAnalysis],
+    devices: Sequence[Dict[str, Any]],
+    devices_path: Path,
+    interactive: bool,
+    input_func: Callable[[str], str] = input,
+    out: Optional[TextIO] = None,
+) -> Tuple[List[FileAnalysis], List[Dict[str, Any]]]:
+    """
+    Register every unknown device before any file is modified.
+
+    Each answer is saved to ``devices.json`` at once and reused for all the
+    matching files of the batch, so a device is asked for only once.
+
+    :param analyses: File analyses, possibly with unknown devices.
+    :param devices: Validated device entries.
+    :param devices_path: Path of ``conf/devices.json``.
+    :param interactive: Whether questions can be asked to the user.
+    :param input_func: Function reading one line, such as ``input``.
+    :param out: Stream for messages; ``sys.stdout`` when ``None``.
+    :return: Tuple ``(analyses, devices)`` with every device resolved and the updated device list.
+    :raises UnknownDeviceError: If devices are unknown and no answer can be obtained.
+    :raises ConfigError: If the devices file cannot be written.
+    """
+    out = sys.stdout if out is None else out
+    current = list(analyses)
+    known = list(devices)
+    unknown = collect_unknown_identities(current)
+    if unknown and not interactive:
+        raise UnknownDeviceError(format_unknown_devices_error(unknown))
+    while unknown:
+        try:
+            device = prompt_new_device(unknown[0], known, input_func, out)
+        except EOFError:
+            raise UnknownDeviceError(format_unknown_devices_error(unknown))
+        known.append(device)
+        write_devices_file(devices_path, {"devices": known})
+        print("  Saved device '{}' to {}".format(device["id"], devices_path), file=out)
+        current = [
+            analysis._replace(status=STATUS_READY, device=device)
+            if analysis.status == STATUS_UNKNOWN_DEVICE and device_matches(device, analysis.identity)
+            else analysis
+            for analysis in current
+        ]
+        unknown = collect_unknown_identities(current)
+    return current, known
+
+
+def analyze_source(
+    source: Path,
+    extensions: Iterable[str],
+    devices: Sequence[Dict[str, Any]],
+    devices_path: Path,
+    executable: Path,
+    recursive: bool = False,
+    forced_device: Optional[Dict[str, Any]] = None,
+    excluded_dirs: Iterable[Path] = (),
+    interactive: bool = False,
+    input_func: Callable[[str], str] = input,
+    out: Optional[TextIO] = None,
+) -> List[FileAnalysis]:
+    """
+    Discover the files of a source folder, read their metadata and identify their devices.
+
+    Source files are only read. Unknown devices are resolved before returning.
+
+    :param source: Source folder.
+    :param extensions: Accepted extensions.
+    :param devices: Validated device entries.
+    :param devices_path: Path of ``conf/devices.json``, updated with new devices.
+    :param executable: Path of the ExifTool executable.
+    :param recursive: Also scan every subfolder when ``True``.
+    :param forced_device: Device imposed with ``--device``, if any.
+    :param excluded_dirs: Folders to skip, with their content.
+    :param interactive: Whether unknown devices can be asked to the user.
+    :param input_func: Function reading one line, such as ``input``.
+    :param out: Stream for messages; ``sys.stdout`` when ``None``.
+    :return: One analysis per discovered file, in discovery order.
+    :raises NotADirectoryError: If ``source`` is not an existing folder.
+    :raises ExifToolError: If ExifTool cannot be started.
+    :raises UnknownDeviceError: If devices are unknown and no answer can be obtained.
+    :raises ConfigError: If the devices file cannot be written.
+    """
+    relatives = discover_files(source, extensions, recursive, excluded_dirs)
+    root = source.resolve()
+    absolute = [root / relative for relative in relatives]
+    metadata, errors = read_metadata(executable, absolute) if absolute else ({}, {})
+    analyses = [
+        analyze_file(relative, metadata.get(path), errors.get(path), devices, forced_device)
+        for relative, path in zip(relatives, absolute)
+    ]
+    analyses, _ = resolve_unknown_devices(analyses, devices, devices_path, interactive, input_func, out)
+    return analyses
+
+
+def print_analysis(analyses: Sequence[FileAnalysis], out: TextIO) -> None:
+    """
+    Print the analysis of every file and a summary (serial numbers are never shown).
+
+    :param analyses: File analyses.
+    :param out: Output stream.
+    """
+    for analysis in analyses:
+        name = analysis.relative.as_posix()
+        if analysis.status == STATUS_READY:
+            device = analysis.device or {}
+            print("[OK]   {}  {} ({})  device '{}'".format(
+                name, analysis.date.isoformat(sep=" ") if analysis.date else "?",
+                analysis.date_tag, device.get("label", "?")), file=out)
+        elif analysis.status == STATUS_AUXILIARY:
+            print("[AUX]  {}  {}".format(name, analysis.message), file=out)
+        else:
+            print("[SKIP] {}  {}".format(name, analysis.message or analysis.status), file=out)
+    counts = {}  # type: Dict[str, int]
+    for analysis in analyses:
+        counts[analysis.status] = counts.get(analysis.status, 0) + 1
+    print("{} file(s): {} ready, {} auxiliary, {} skipped.".format(
+        len(analyses), counts.get(STATUS_READY, 0), counts.get(STATUS_AUXILIARY, 0),
+        len(analyses) - counts.get(STATUS_READY, 0) - counts.get(STATUS_AUXILIARY, 0)), file=out)
+
+
 def run_check(
     project_root: Path,
     timezone: Optional[str] = None,
@@ -690,6 +1440,8 @@ def main(
     argv: Optional[List[str]] = None,
     project_root: Optional[Path] = None,
     environ: Optional[Mapping[str, str]] = None,
+    interactive: Optional[bool] = None,
+    input_func: Callable[[str], str] = input,
 ) -> int:
     """
     Run the MediaRenamer command line interface.
@@ -697,6 +1449,8 @@ def main(
     :param argv: Command line arguments, defaults to ``sys.argv[1:]`` when ``None``.
     :param project_root: Project folder containing ``conf/`` and ``bin/``; this file's folder when ``None``.
     :param environ: Environment variables; ``os.environ`` when ``None``.
+    :param interactive: Whether unknown devices can be asked; detected from the terminal when ``None``.
+    :param input_func: Function reading one line, such as ``input``.
     :return: Process exit code (0 on success).
     """
     parser = build_arg_parser()
@@ -714,7 +1468,7 @@ def main(
     if args.check:
         return run_check(root, args.tz, environ)
     try:
-        load_config(conf_dir / CONFIG_FILE_NAME)
+        config = load_config(conf_dir / CONFIG_FILE_NAME)
         devices = load_devices(conf_dir / DEVICES_FILE_NAME)
     except ConfigError as error:
         print("[ERROR] {}".format(error), file=sys.stderr)
@@ -722,11 +1476,33 @@ def main(
     if args.tz is not None and validate_timezone(args.tz):
         print("[ERROR] --tz: {}".format(validate_timezone(args.tz)), file=sys.stderr)
         return 1
-    if args.device is not None and find_device(devices, args.device) is None:
-        print("[ERROR] --device: unknown device id {!r}".format(args.device), file=sys.stderr)
+    forced_device = None
+    if args.device is not None:
+        forced_device = find_device(devices, args.device)
+        if forced_device is None:
+            print("[ERROR] --device: unknown device id {!r}".format(args.device), file=sys.stderr)
+            return 1
+    source = Path(args.source)
+    if not source.is_dir():
+        print("[ERROR] --source: folder not found: {}".format(source), file=sys.stderr)
         return 1
-    print("[ERROR] Renaming is not implemented yet (see docs/BACKLOG.md, Epic 2+).", file=sys.stderr)
-    return 1
+    excluded = [root / LOGS_DIR_NAME] + ([Path(args.dest)] if args.dest else [])
+    is_interactive = sys.stdin.isatty() if interactive is None else interactive
+    try:
+        executable = find_exiftool(root / BIN_DIR_NAME, environ)
+        analyses = analyze_source(
+            source, config["supported_extensions"], devices, conf_dir / DEVICES_FILE_NAME, executable,
+            args.recursive, forced_device, excluded, is_interactive, input_func,
+        )
+    except (ConfigError, ExifToolError, UnknownDeviceError) as error:
+        print("[ERROR] {}".format(error), file=sys.stderr)
+        return 1
+    print_analysis(analyses, sys.stdout)
+    if args.apply:
+        print("[ERROR] Renaming and copying are not implemented yet (see docs/BACKLOG.md, Epic 4+).",
+              file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

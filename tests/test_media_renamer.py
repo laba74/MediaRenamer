@@ -4,7 +4,9 @@ import io
 import json
 import os
 import shutil
+import struct
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -887,6 +889,716 @@ def test_run_check_reports_missing_exiftool(project: Path) -> None:
     assert "[OK] Configuration" in out
 
 
+# --- path_key / discover_files ------------------------------------------------
+
+
+def test_path_key_normalizes() -> None:
+    """
+    Check that equivalent spellings of a path share the same key.
+    """
+    assert mr.path_key("a/b/../c.jpg") == mr.path_key(Path("a") / "c.jpg")
+    if os.name == "nt":
+        assert mr.path_key("C:/Dir/File.JPG") == mr.path_key("c:\\dir\\file.jpg")
+
+
+def make_tree(root: Path, names: Any) -> None:
+    """
+    Create empty files (and their folders) under a root folder.
+
+    :param root: Root folder.
+    :param names: Relative POSIX paths of the files to create.
+    """
+    for name in names:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+
+
+@pytest.fixture
+def media_tree(tmp_path: Path) -> Path:
+    """
+    Create a source folder with nested media and non-media files.
+
+    :param tmp_path: Pytest temporary folder.
+    :return: Source folder.
+    """
+    source = tmp_path / "src"
+    make_tree(source, [
+        "b.JPG", "a.mp4", "notes.txt", "sub/c.jpg", "sub/deep/d.MOV", "sub/deep/e.json",
+        ".logs/f.jpg", "out/g.jpg", "empty/readme.md",
+    ])
+    return source
+
+
+def test_discover_files_flat(media_tree: Path) -> None:
+    """
+    Check that only the source folder is scanned without ``--recursive``, case-insensitively.
+    """
+    assert mr.discover_files(media_tree, [".jpg", ".mp4", ".mov"]) == [Path("a.mp4"), Path("b.JPG")]
+
+
+def test_discover_files_recursive_keeps_relative_paths(media_tree: Path) -> None:
+    """
+    Check that a recursive scan keeps relative paths and skips ``.logs`` and excluded folders.
+    """
+    found = mr.discover_files(media_tree, [".jpg", ".mp4", ".mov"], recursive=True,
+                              excluded_dirs=[media_tree / "out"])
+    assert found == [Path("a.mp4"), Path("b.JPG"), Path("sub/c.jpg"), Path("sub/deep/d.MOV")]
+
+
+def test_discover_files_recursive_without_exclusion(media_tree: Path) -> None:
+    """
+    Check that a destination is only skipped when excluded.
+    """
+    found = mr.discover_files(media_tree, [".jpg"], recursive=True)
+    assert Path("out/g.jpg") in found and Path(".logs/f.jpg") not in found
+
+
+def test_discover_files_missing_source(tmp_path: Path) -> None:
+    """
+    Check that a missing source folder raises ``NotADirectoryError``.
+    """
+    with pytest.raises(NotADirectoryError, match="source folder not found"):
+        mr.discover_files(tmp_path / "missing", [".jpg"])
+
+
+# --- ExifTool wrapper ---------------------------------------------------------
+
+
+def test_build_exiftool_command() -> None:
+    """
+    Check that the command requests JSON, UTF-8 names and only the needed tags.
+    """
+    command = mr.build_exiftool_command(Path("exiftool"), Path("list.args"))
+    assert command[0] == "exiftool" and "-json" in command
+    assert command[-2:] == ["-@", "list.args"]
+    assert "-DateTimeOriginal" in command and "-SerialNumber" in command
+    assert not any("GPS" in part for part in command)
+
+
+def test_find_stderr_message() -> None:
+    """
+    Check that the ExifTool error about a file is extracted.
+    """
+    path = Path("/data/a - b.jpg")
+    lines = ["Warning: other - /data/x.jpg", "Error: File not found - /data/a - b.jpg"]
+    assert mr.find_stderr_message(lines, path) == "Error: File not found"
+    assert mr.find_stderr_message(lines, Path("/data/none.jpg")) is None
+
+
+def test_parse_exiftool_output_splits_results() -> None:
+    """
+    Check that metadata, error records and missing files are sorted out.
+    """
+    ok, bad, missing, silent = (Path("/d/ok.jpg"), Path("/d/bad.jpg"), Path("/d/missing.jpg"), Path("/d/s.jpg"))
+    stdout = json.dumps([
+        {"SourceFile": "/d/ok.jpg", "Make": "GoPro"},
+        {"SourceFile": "/d/bad.jpg", "Error": "File format error"},
+        {"SourceFile": "/d/other.jpg"},
+        "garbage",
+    ])
+    stderr = "Error: File not found - /d/missing.jpg\n"
+    metadata, errors = mr.parse_exiftool_output(stdout, stderr, [ok, bad, missing, silent])
+    assert metadata == {ok: {"SourceFile": "/d/ok.jpg", "Make": "GoPro"}}
+    assert errors == {
+        bad: "File format error",
+        missing: "Error: File not found",
+        silent: "no metadata returned by ExifTool",
+    }
+
+
+@pytest.mark.parametrize("stdout, expected", [("{oops", "unreadable"), ("{}", "unexpected")])
+def test_parse_exiftool_output_invalid(stdout: str, expected: str) -> None:
+    """
+    Check that unusable output marks every file as failed.
+    """
+    metadata, errors = mr.parse_exiftool_output(stdout, "", [Path("/d/a.jpg")])
+    assert metadata == {} and expected in errors[Path("/d/a.jpg")]
+
+
+def test_run_exiftool_batch_uses_argfile(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    Check that file names are passed in a UTF-8 argument file, removed afterwards.
+    """
+    path = tmp_path / "été.jpg"
+    seen = {}  # type: Dict[str, Any]
+
+    def run(command: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        """
+        Record the argument file and answer like ExifTool.
+
+        :param command: Command line.
+        :param kwargs: Ignored keyword arguments.
+        :return: Completed process with JSON output.
+        """
+        seen["argfile"] = Path(command[-1])
+        seen["content"] = seen["argfile"].read_text(encoding="utf-8")
+        stdout = json.dumps([{"SourceFile": path.as_posix(), "Model": "X"}]).encode("utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout, b"")
+
+    monkeypatch.setattr(mr.subprocess, "run", run)
+    metadata, errors = mr.run_exiftool_batch(Path("exiftool"), [path], timeout=5)
+    assert metadata[path]["Model"] == "X" and errors == {}
+    assert seen["content"] == path.as_posix() + "\n"
+    assert not seen["argfile"].exists()
+
+
+def test_run_exiftool_batch_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that a timeout marks every file of the batch as failed.
+    """
+    monkeypatch.setattr(mr.subprocess, "run", fake_run(error=subprocess.TimeoutExpired("exiftool", 5)))
+    metadata, errors = mr.run_exiftool_batch(Path("exiftool"), [Path("/a.jpg"), Path("/b.jpg")], timeout=5)
+    assert metadata == {} and len(errors) == 2
+    assert "no answer after 5 seconds" in errors[Path("/a.jpg")]
+
+
+def test_run_exiftool_batch_cannot_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that an ExifTool that cannot start raises ``ExifToolError``.
+    """
+    monkeypatch.setattr(mr.subprocess, "run", fake_run(error=FileNotFoundError("missing")))
+    with pytest.raises(mr.ExifToolError, match="cannot be started"):
+        mr.run_exiftool_batch(Path("exiftool"), [Path("/a.jpg")], timeout=5)
+
+
+def test_read_metadata_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that files are split into batches and results merged.
+    """
+    calls = []
+
+    def batch(executable: Path, paths: Any, timeout: float) -> Any:
+        """
+        Record the batch and fail on ``c.jpg``.
+
+        :param executable: Ignored.
+        :param paths: Batch of files.
+        :param timeout: Batch timeout.
+        :return: Tuple ``(metadata, errors)``.
+        """
+        calls.append((list(paths), timeout))
+        return ({p: {} for p in paths if p.name != "c.jpg"}, {p: "bad" for p in paths if p.name == "c.jpg"})
+
+    monkeypatch.setattr(mr, "run_exiftool_batch", batch)
+    paths = [Path("a.jpg"), Path("b.jpg"), Path("c.jpg")]
+    metadata, errors = mr.read_metadata(Path("exiftool"), paths, batch_size=2)
+    assert [len(call[0]) for call in calls] == [2, 1]
+    assert calls[0][1] > calls[1][1] >= mr.EXIFTOOL_TIMEOUT_SECONDS
+    assert set(metadata) == {Path("a.jpg"), Path("b.jpg")} and errors == {Path("c.jpg"): "bad"}
+
+
+# --- dates ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("2024:07:14 17:19:24", datetime(2024, 7, 14, 17, 19, 24)),
+        ("2024:02:29 23:59:58.123", datetime(2024, 2, 29, 23, 59, 58)),
+        ("2024:07:14 17:19", datetime(2024, 7, 14, 17, 19, 0)),
+        ("2024-07-14T17:19:24", datetime(2024, 7, 14, 17, 19, 24)),
+        ("2024:07:14 17:19:24Z", datetime(2024, 7, 14, 17, 19, 24, tzinfo=timezone.utc)),
+        ("2024:07:14 17:19:24+02:00", datetime(2024, 7, 14, 17, 19, 24, tzinfo=timezone(timedelta(hours=2)))),
+        ("2024:07:14 17:19:24-0530",
+         datetime(2024, 7, 14, 17, 19, 24, tzinfo=timezone(-timedelta(hours=5, minutes=30)))),
+        ("0000:00:00 00:00:00", None),
+        ("2023:02:29 10:00:00", None),
+        ("    :  :     :  :  ", None),
+        ("", None),
+        (None, None),
+        (20240714, None),
+    ],
+)
+def test_parse_exif_datetime(value: Any, expected: Optional[datetime]) -> None:
+    """
+    Check valid, partial, zoned and invalid ExifTool dates.
+    """
+    assert mr.parse_exif_datetime(value) == expected
+
+
+def test_select_capture_date_priority() -> None:
+    """
+    Check that ``DateTimeOriginal`` wins and invalid values fall through to the next tag.
+    """
+    tags = {"CreateDate": "2020:01:01 00:00:00", "DateTimeOriginal": "2021:01:01 00:00:00"}
+    assert mr.select_capture_date(tags) == ("DateTimeOriginal", datetime(2021, 1, 1))
+    tags = {"DateTimeOriginal": "0000:00:00 00:00:00", "MediaCreateDate": "2022:05:06 07:08:09"}
+    assert mr.select_capture_date(tags) == ("MediaCreateDate", datetime(2022, 5, 6, 7, 8, 9))
+    assert mr.select_capture_date({"FileModifyDate": "2022:05:06 07:08:09"}) is None
+
+
+# --- device identification ----------------------------------------------------
+
+
+def test_clean_and_normalize_text() -> None:
+    """
+    Check value cleaning and case-insensitive normalization.
+    """
+    assert mr.clean_text(None) == "" and mr.clean_text(12345) == "12345" and mr.clean_text(" a ") == "a"
+    assert mr.normalize_text("  HERO9   Black ") == "hero9 black"
+
+
+def test_extract_identity() -> None:
+    """
+    Check that make, model and serial number are read, with empty defaults.
+    """
+    identity = mr.extract_identity({"Make": "GoPro ", "Model": "HERO9 Black", "SerialNumber": 123})
+    assert identity == mr.DeviceIdentity("GoPro", "HERO9 Black", "123")
+    assert mr.extract_identity({}) == mr.DeviceIdentity("", "", "")
+
+
+@pytest.mark.parametrize(
+    "match, identity, expected",
+    [
+        ({"make": "gopro", "model": "hero9 BLACK"}, ("GoPro", "HERO9 Black", "S1"), True),
+        ({"make": "GoPro", "model": "HERO9 Black", "serial_number": ""}, ("GoPro", "HERO9 Black", "S1"), True),
+        ({"make": "GoPro", "model": "HERO9 Black", "serial_number": "s1"}, ("GoPro", "HERO9 Black", "S1"), True),
+        ({"make": "GoPro", "model": "HERO9 Black", "serial_number": "S2"}, ("GoPro", "HERO9 Black", "S1"), False),
+        ({"make": "GoPro", "model": "HERO9 Black", "serial_number": "S2"}, ("", "HERO9 Black", ""), True),
+        ({"make": "GoPro", "model": "HERO9 Black"}, ("Canon", "HERO9 Black", ""), False),
+        ({"make": "GoPro", "model": "HERO9 Black"}, ("GoPro", "", ""), False),
+        ({"make": "GoPro", "model": "HERO9 Black"}, ("GoPro", "HERO10 Black", ""), False),
+        ({"make": "GoPro"}, ("GoPro", "Anything", ""), True),
+        ({"make": "GoPro"}, ("", "Anything", ""), False),
+    ],
+)
+def test_device_matches(match: Dict[str, str], identity: Any, expected: bool) -> None:
+    """
+    Check case-insensitivity, optional serial number and missing file values.
+    """
+    assert mr.device_matches(make_device(match=match), mr.DeviceIdentity(*identity)) is expected
+
+
+def test_match_device_first_match_wins() -> None:
+    """
+    Check that the first matching entry wins and ``None`` is returned without match.
+    """
+    devices = [
+        make_device(id="any", match={"model": "HERO9 Black"}),
+        make_device(id="body", match={"model": "HERO9 Black", "serial_number": "S1"}),
+    ]
+    assert mr.match_device(devices, mr.DeviceIdentity("GoPro", "HERO9 Black", "S1"))["id"] == "any"
+    assert mr.match_device(devices, mr.DeviceIdentity("GoPro", "HERO8", "")) is None
+
+
+DATED_TAGS = {"DateTimeOriginal": "2024:01:02 03:04:05", "Make": "GoPro", "Model": "HERO9 Black"}
+
+
+def test_analyze_file_statuses() -> None:
+    """
+    Check every outcome of the analysis of one file.
+    """
+    devices = [make_device()]
+    forced = make_device(id="forced", label="Forced", match={"model": "Other"})
+    aux = mr.analyze_file(Path("GL01.LRV"), None, "boom", devices)
+    assert aux.status == mr.STATUS_AUXILIARY
+    failed = mr.analyze_file(Path("a.jpg"), None, "File format error", devices)
+    assert failed.status == mr.STATUS_SKIPPED and "File format error" in failed.message
+    undated = mr.analyze_file(Path("a.jpg"), {"Make": "GoPro"}, None, devices)
+    assert undated.status == mr.STATUS_SKIPPED and "no valid capture date" in undated.message
+    ready = mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, devices)
+    assert (ready.status, ready.device["id"], ready.date_tag) == (mr.STATUS_READY, "gopro9", "DateTimeOriginal")
+    assert ready.date == datetime(2024, 1, 2, 3, 4, 5)
+    assert mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [], forced).device["id"] == "forced"
+    anonymous = mr.analyze_file(Path("a.mp4"), {"CreateDate": "2024:01:02 03:04:05"}, None, devices)
+    assert anonymous.status == mr.STATUS_SKIPPED and "--device" in anonymous.message
+    unknown = mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [])
+    assert unknown.status == mr.STATUS_UNKNOWN_DEVICE and unknown.identity.model == "HERO9 Black"
+
+
+def make_unknown(name: str, make: str, model: str, serial: str = "") -> mr.FileAnalysis:
+    """
+    Build the analysis of a file with an unknown device.
+
+    :param name: Relative file name.
+    :param make: Camera make.
+    :param model: Camera model.
+    :param serial: Camera serial number.
+    :return: File analysis.
+    """
+    return mr.FileAnalysis(Path(name), mr.STATUS_UNKNOWN_DEVICE, "", "DateTimeOriginal",
+                           datetime(2024, 1, 2), mr.DeviceIdentity(make, model, serial), None)
+
+
+def test_collect_unknown_identities() -> None:
+    """
+    Check that unknown identifications are deduplicated in order of appearance.
+    """
+    analyses = [make_unknown("a", "X", "1"), make_unknown("b", "Y", "2"), make_unknown("c", "X", "1")]
+    analyses.append(mr.analyze_file(Path("d.thm"), None, None, []))
+    assert mr.collect_unknown_identities(analyses) == [mr.DeviceIdentity("X", "1", ""), mr.DeviceIdentity("Y", "2", "")]
+
+
+def test_mask_serial_and_describe_identity() -> None:
+    """
+    Check that serial numbers are masked in descriptions.
+    """
+    assert mr.mask_serial("") == "" and mr.mask_serial("123") == "***"
+    assert mr.mask_serial("C3441326974391") == "***4391"
+    text = mr.describe_identity(mr.DeviceIdentity("GoPro", "HERO9 Black", "C3441326974391"))
+    assert text == "Make 'GoPro', Model 'HERO9 Black', serial ***4391"
+    assert mr.describe_identity(mr.DeviceIdentity("", "", "")) == "no identification"
+
+
+def test_make_device_id() -> None:
+    """
+    Check that ids are slugs, unique among existing devices.
+    """
+    devices = [make_device(id="sony-tf1"), make_device(id="Sony-TF1-2")]
+    assert mr.make_device_id("GoPro 9", []) == "gopro-9"
+    assert mr.make_device_id("Sony TF1", devices) == "sony-tf1-3"
+    assert mr.make_device_id("***", []) == "device"
+
+
+def test_default_label() -> None:
+    """
+    Check that the suggested label comes from the model, then the make.
+    """
+    assert mr.default_label(mr.DeviceIdentity("GoPro", "HERO9: Black", "")) == "HERO9 Black"
+    assert mr.default_label(mr.DeviceIdentity("NIKON", "", "")) == "NIKON"
+    assert mr.default_label(mr.DeviceIdentity("", "", "")) == "Device"
+
+
+def test_answer_validators() -> None:
+    """
+    Check the validation of each interactive answer.
+    """
+    assert mr.validate_label_answer("GoPro9") is None
+    assert "empty" in mr.validate_label_answer("")
+    assert "invalid" in mr.validate_label_answer("a/b")
+    assert mr.validate_offset_answer("-01:00:00") is None
+    assert "invalid offset" in mr.validate_offset_answer("1h")
+    assert mr.validate_timezone_answer("") is None
+    assert mr.validate_timezone_answer("not a zone") is not None
+    assert mr.validate_yes_no_answer("Yes") is None and mr.validate_yes_no_answer("maybe") is not None
+
+
+def scripted(answers: Any) -> Any:
+    """
+    Build an input function returning scripted answers.
+
+    :param answers: Answers to return, in order.
+    :return: Function usable in place of ``input``.
+    """
+    iterator = iter(answers)
+
+    def read(prompt: str) -> str:
+        """
+        Return the next scripted answer, or raise ``EOFError`` when exhausted.
+
+        :param prompt: Ignored question.
+        :return: Next answer.
+        :raises EOFError: When no answer is left.
+        """
+        try:
+            return next(iterator)
+        except StopIteration:
+            raise EOFError
+
+    return read
+
+
+def test_ask_retries_until_valid_and_uses_default() -> None:
+    """
+    Check that invalid answers are re-asked and Enter selects the default.
+    """
+    out = io.StringIO()
+    assert mr.ask(scripted(["bad", "+00:00:10"]), out, "? ", mr.validate_offset_answer) == "+00:00:10"
+    assert "invalid offset" in out.getvalue()
+    assert mr.ask(scripted(["  "]), out, "? ", mr.validate_offset_answer, "+00:00:00") == "+00:00:00"
+
+
+def test_prompt_new_device_with_serial_and_timezone() -> None:
+    """
+    Check that the answers build a valid entry, with the serial number on request.
+    """
+    identity = mr.DeviceIdentity("GoPro", "HERO9 Black", "C3441326974391")
+    out = io.StringIO()
+    device = mr.prompt_new_device(identity, [], scripted(["GoPro 9", "-01:00:00", "Europe/Paris", "y"]), out)
+    assert device == {
+        "id": "gopro-9", "label": "GoPro 9", "offset": "-01:00:00", "timezone": "Europe/Paris",
+        "match": {"make": "GoPro", "model": "HERO9 Black", "serial_number": "C3441326974391"},
+    }
+    assert "C3441326974391" not in out.getvalue()
+    assert mr.validate_device(device, available_timezones=set()) == []
+
+
+def test_prompt_new_device_defaults() -> None:
+    """
+    Check the default label and offset, and that the serial number is not used by default.
+    """
+    identity = mr.DeviceIdentity("", "HERO9 Black", "S1")
+    device = mr.prompt_new_device(identity, [], scripted(["", "", "", ""]), io.StringIO())
+    assert device == {"id": "hero9-black", "label": "HERO9 Black", "offset": "+00:00:00",
+                      "match": {"model": "HERO9 Black"}}
+
+
+def test_format_unknown_devices_error() -> None:
+    """
+    Check that the message lists devices (masked serial) and the possible fixes.
+    """
+    text = mr.format_unknown_devices_error([mr.DeviceIdentity("GoPro", "HERO9", "C3441326974391")])
+    assert "1 unknown device(s)" in text and "***4391" in text and "--device" in text
+    assert "C3441326974391" not in text
+
+
+# --- resolve_unknown_devices --------------------------------------------------
+
+
+def test_resolve_unknown_devices_nothing_to_do(tmp_path: Path) -> None:
+    """
+    Check that nothing is asked nor written when every device is known.
+    """
+    analyses = [mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [make_device()])]
+    result, devices = mr.resolve_unknown_devices(analyses, [make_device()], tmp_path / "devices.json",
+                                                 interactive=False, input_func=scripted([]))
+    assert result == analyses and len(devices) == 1
+    assert not (tmp_path / "devices.json").exists()
+
+
+def test_resolve_unknown_devices_non_interactive(tmp_path: Path) -> None:
+    """
+    Check that a non-interactive run with unknown devices raises a clear error.
+    """
+    with pytest.raises(mr.UnknownDeviceError, match="no interactive terminal"):
+        mr.resolve_unknown_devices([make_unknown("a.jpg", "GoPro", "HERO9")], [], tmp_path / "devices.json",
+                                   interactive=False)
+
+
+def test_resolve_unknown_devices_closed_input(tmp_path: Path) -> None:
+    """
+    Check that a closed input stream is reported like a non-interactive run.
+    """
+    with pytest.raises(mr.UnknownDeviceError):
+        mr.resolve_unknown_devices([make_unknown("a.jpg", "GoPro", "HERO9")], [], tmp_path / "devices.json",
+                                   interactive=True, input_func=scripted([]), out=io.StringIO())
+
+
+def test_resolve_unknown_devices_asks_once_per_device(tmp_path: Path) -> None:
+    """
+    Check that one answer covers every matching file and is persisted.
+
+    The video has no make nor serial number, the photos have both: a single
+    question must cover all of them.
+    """
+    path = write_json(tmp_path / "devices.json", {"devices": [make_device(id="other", match={"model": "X"})]})
+    analyses = [
+        make_unknown("v.mp4", "", "HERO9 Black"),
+        make_unknown("p1.jpg", "GoPro", "HERO9 Black", "S1"),
+        make_unknown("p2.jpg", "GoPro", "HERO9 Black", "S1"),
+        make_unknown("n.jpg", "NIKON", "E4500"),
+    ]
+    prompts = []
+
+    def read(prompt: str) -> str:
+        """
+        Record the question and accept the defaults.
+
+        :param prompt: Question shown.
+        :return: Empty answer.
+        """
+        prompts.append(prompt)
+        return ""
+
+    out = io.StringIO()
+    result, devices = mr.resolve_unknown_devices(analyses, mr.load_devices(path), path, True, read, out)
+    assert all(analysis.status == mr.STATUS_READY for analysis in result)
+    assert [analysis.device["id"] for analysis in result] == ["hero9-black"] * 3 + ["e4500"]
+    assert sum("Label" in prompt for prompt in prompts) == 2
+    assert [device["id"] for device in mr.load_devices(path)] == ["other", "hero9-black", "e4500"]
+    assert (tmp_path / "devices.json.bak").is_file()
+    assert devices == mr.load_devices(path)
+
+
+# --- analyze_source / print_analysis ------------------------------------------
+
+
+def test_analyze_source_reads_without_modifying(
+    media_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Check the whole analysis pipeline with faked metadata, and that sources are untouched.
+    """
+    seen = []
+
+    def fake_read_metadata(executable: Path, paths: Any) -> Any:
+        """
+        Return dated GoPro tags for every file.
+
+        :param executable: Ignored.
+        :param paths: Files to describe.
+        :return: Tuple ``(metadata, errors)``.
+        """
+        seen.extend(paths)
+        return {path: dict(DATED_TAGS) for path in paths}, {}
+
+    monkeypatch.setattr(mr, "read_metadata", fake_read_metadata)
+    before = snapshot(media_tree)
+    analyses = mr.analyze_source(media_tree, [".jpg", ".mp4"], [make_device()], tmp_path / "devices.json",
+                                 Path("exiftool"), recursive=True, excluded_dirs=[media_tree / "out"])
+    assert [analysis.relative for analysis in analyses] == [Path("a.mp4"), Path("b.JPG"), Path("sub/c.jpg")]
+    assert all(path.is_absolute() for path in seen)
+    assert all(analysis.status == mr.STATUS_READY for analysis in analyses)
+    assert snapshot(media_tree) == before
+
+
+def test_analyze_source_empty_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that an empty folder does not call ExifTool.
+    """
+    monkeypatch.setattr(mr, "read_metadata", None)
+    assert mr.analyze_source(tmp_path, [".jpg"], [], tmp_path / "devices.json", Path("exiftool")) == []
+
+
+def test_print_analysis_hides_serial_numbers() -> None:
+    """
+    Check the printed lines and summary, without serial numbers.
+    """
+    tags = dict(DATED_TAGS, SerialNumber="C3441326974391")
+    analyses = [
+        mr.analyze_file(Path("sub/a.jpg"), tags, None, [make_device()]),
+        mr.analyze_file(Path("b.thm"), None, None, []),
+        mr.analyze_file(Path("c.jpg"), None, "File format error", []),
+    ]
+    out = io.StringIO()
+    mr.print_analysis(analyses, out)
+    text = out.getvalue()
+    assert "[OK]   sub/a.jpg  2024-01-02 03:04:05 (DateTimeOriginal)  device 'GoPro9'" in text
+    assert "[AUX]  b.thm" in text and "[SKIP] c.jpg  unreadable metadata (File format error)" in text
+    assert "3 file(s): 1 ready, 1 auxiliary, 1 skipped." in text
+    assert "C3441326974391" not in text
+
+
+# --- real ExifTool integration ------------------------------------------------
+
+
+def snapshot(folder: Path) -> Dict[str, Any]:
+    """
+    Record the content and modification time of every file of a folder.
+
+    :param folder: Folder to record.
+    :return: Mapping of relative path to ``(bytes, mtime_ns)``.
+    """
+    return {
+        path.relative_to(folder).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in sorted(folder.rglob("*")) if path.is_file()
+    }
+
+
+@pytest.fixture(scope="session")
+def real_exiftool() -> Path:
+    """
+    Locate a working ExifTool (``bin/``, ``PATH`` or ``EXIFTOOL_PATH``), or skip the test.
+
+    :return: Path of the ExifTool executable.
+    """
+    try:
+        executable = mr.find_exiftool(REPO_ROOT / "bin")
+        mr.get_exiftool_version(executable)
+    except mr.ExifToolError as error:
+        pytest.skip("real ExifTool not available: {}".format(error))
+    return executable
+
+
+MINIMAL_JPEG = b"\xff\xd8\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x00\xff\xd9"
+MINIMAL_TIFF = b"II*\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
+
+def write_tags(executable: Path, path: Path, tags: Dict[str, str]) -> None:
+    """
+    Write tags into a sample file with ExifTool.
+
+    :param executable: Path of the ExifTool executable.
+    :param path: Sample file.
+    :param tags: Tags to write.
+    """
+    command = [str(executable), "-q", "-overwrite_original"]
+    command.extend("-{}={}".format(name, value) for name, value in tags.items())
+    subprocess.run(command + [str(path)], check=True, capture_output=True)
+
+
+def make_mp4(path: Path, created: datetime) -> None:
+    """
+    Write a minimal MP4 file whose movie header holds a creation date.
+
+    :param path: File to create.
+    :param created: Creation date stored in the ``mvhd`` atom.
+    """
+    seconds = int((created - datetime(1904, 1, 1)).total_seconds())
+    matrix = struct.pack(">9I", 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
+    mvhd = struct.pack(">I4I", 0, seconds, seconds, 1000, 0) + struct.pack(">IH", 0x10000, 0x100)
+    mvhd += b"\x00" * 10 + matrix + b"\x00" * 24 + struct.pack(">I", 1)
+    mvhd_box = struct.pack(">I", 8 + len(mvhd)) + b"mvhd" + mvhd
+    moov = struct.pack(">I", 8 + len(mvhd_box)) + b"moov" + mvhd_box
+    ftyp = struct.pack(">I", 20) + b"ftypisom" + struct.pack(">I", 0x200) + b"isom"
+    path.write_bytes(ftyp + moov)
+
+
+@pytest.fixture
+def real_samples(tmp_path: Path, real_exiftool: Path) -> Path:
+    """
+    Create real JPG, MP4 and DNG samples, plus an undated photo, in nested folders.
+
+    :param tmp_path: Pytest temporary folder.
+    :param real_exiftool: Path of a working ExifTool.
+    :return: Source folder.
+    """
+    source = tmp_path / "src"
+    (source / "été").mkdir(parents=True)
+    jpg = source / "été" / "GOPR0001.JPG"
+    jpg.write_bytes(MINIMAL_JPEG)
+    write_tags(real_exiftool, jpg, {"Make": "GoPro", "Model": "HERO9 Black", "SerialNumber": "C3441326974391",
+                                    "DateTimeOriginal": "2024:02:29 23:59:58"})
+    make_mp4(source / "GH010001.MP4", datetime(2024, 3, 1, 10, 0, 0))
+    write_tags(real_exiftool, source / "GH010001.MP4", {"Model": "HERO9 Black"})
+    dng = source / "raw" / "IMG_0001.DNG"
+    dng.parent.mkdir()
+    dng.write_bytes(MINIMAL_TIFF)
+    write_tags(real_exiftool, dng, {"Make": "Canon", "Model": "EOS 6D", "DateTimeOriginal": "2023:12:31 08:00:00"})
+    (source / "undated.jpg").write_bytes(MINIMAL_JPEG)
+    (source / "corrupt.jpg").write_bytes(b"not a picture")
+    return source
+
+
+def test_read_metadata_real_samples(real_samples: Path, real_exiftool: Path) -> None:
+    """
+    Check metadata extraction from real JPG, MP4 and DNG files (non-ASCII folder included).
+    """
+    paths = [real_samples / "été" / "GOPR0001.JPG", real_samples / "GH010001.MP4",
+             real_samples / "raw" / "IMG_0001.DNG", real_samples / "missing.jpg"]
+    metadata, errors = mr.read_metadata(real_exiftool, paths)
+    assert mr.select_capture_date(metadata[paths[0]]) == ("DateTimeOriginal", datetime(2024, 2, 29, 23, 59, 58))
+    assert mr.extract_identity(metadata[paths[0]]) == mr.DeviceIdentity("GoPro", "HERO9 Black", "C3441326974391")
+    assert mr.select_capture_date(metadata[paths[1]]) == ("CreateDate", datetime(2024, 3, 1, 10, 0, 0))
+    assert mr.extract_identity(metadata[paths[2]]).model == "EOS 6D"
+    assert "not found" in errors[paths[3]]
+
+
+def test_analyze_source_real_samples(real_samples: Path, real_exiftool: Path, tmp_path: Path) -> None:
+    """
+    Check the full analysis with ExifTool: one question per device, persisted, no source change.
+    """
+    devices_path = write_json(tmp_path / "devices.json", {"devices": []})
+    before = snapshot(real_samples)
+    # The MP4 (no serial number) is met first, so no serial question is asked.
+    answers = ["GoPro9", "-01:00:00", "", "EOS6D", "", ""]
+    analyses = mr.analyze_source(real_samples, [".jpg", ".mp4", ".dng"], [], devices_path, real_exiftool,
+                                 recursive=True, interactive=True, input_func=scripted(answers),
+                                 out=io.StringIO())
+    by_name = {analysis.relative.as_posix(): analysis for analysis in analyses}
+    assert by_name["GH010001.MP4"].device["label"] == "GoPro9"
+    assert by_name["été/GOPR0001.JPG"].device["label"] == "GoPro9"
+    assert by_name["raw/IMG_0001.DNG"].device["label"] == "EOS6D"
+    assert by_name["undated.jpg"].status == mr.STATUS_SKIPPED
+    assert by_name["corrupt.jpg"].status == mr.STATUS_SKIPPED
+    assert [device["label"] for device in mr.load_devices(devices_path)] == ["GoPro9", "EOS6D"]
+    again = mr.analyze_source(real_samples, [".jpg", ".mp4", ".dng"], mr.load_devices(devices_path),
+                              devices_path, real_exiftool, recursive=True, interactive=False)
+    assert [analysis.status for analysis in again] == [analysis.status for analysis in analyses]
+    assert snapshot(real_samples) == before
+
+
 # --- main ---------------------------------------------------------------------
 
 
@@ -922,12 +1634,89 @@ def test_main_check_missing_template(tmp_path: Path, capsys: pytest.CaptureFixtu
     assert "template" in capsys.readouterr().err
 
 
-def test_main_rename_not_implemented(checked_project: Path, capsys: pytest.CaptureFixture) -> None:
+def test_main_rename_missing_source(checked_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
-    Check that a rename run validates the configuration then reports it is not implemented yet.
+    Check that a missing source folder is reported.
     """
-    assert mr.main(["--source", "in"], project_root=checked_project) == 1
+    assert mr.main(["--source", str(checked_project / "nope")], project_root=checked_project) == 1
+    assert "folder not found" in capsys.readouterr().err
+
+
+@pytest.fixture
+def analyzed_project(checked_project: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """
+    Prepare a project with a ``src`` folder of two photos and faked metadata.
+
+    :param checked_project: Project with a fake ExifTool.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :return: Project root.
+    """
+    source = checked_project / "src"
+    source.mkdir()
+    (source / "a.jpg").write_bytes(b"a")
+    (source / "b.jpg").write_bytes(b"b")
+    tags = {"DateTimeOriginal": "2024:01:02 03:04:05", "Make": "GoPro", "Model": "HERO9 Black"}
+
+    def fake_read_metadata(executable: Path, paths: Any) -> Any:
+        """
+        Return the same tags for every file.
+
+        :param executable: Ignored.
+        :param paths: Files to describe.
+        :return: Tuple ``(metadata, errors)``.
+        """
+        return {path: dict(tags) for path in paths}, {}
+
+    monkeypatch.setattr(mr, "read_metadata", fake_read_metadata)
+    return checked_project
+
+
+def test_main_analysis_prompts_once_and_saves(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that an interactive run registers the unknown device once and prints the analysis.
+    """
+    answers = iter(["GoPro9", "-01:00:00", ""])
+    code = mr.main(["--source", str(analyzed_project / "src")], project_root=analyzed_project,
+                   interactive=True, input_func=lambda prompt: next(answers))
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[OK]   a.jpg" in out and "device 'GoPro9'" in out and "2 ready" in out
+    devices = mr.load_devices(analyzed_project / "conf" / "devices.json")
+    assert [device["id"] for device in devices] == ["gopro9"]
+
+
+def test_main_analysis_non_interactive_unknown_device(
+    analyzed_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """
+    Check that a non-interactive run with an unknown device fails clearly.
+    """
+    code = mr.main(["--source", str(analyzed_project / "src")], project_root=analyzed_project, interactive=False)
+    assert code == 1
+    assert "unknown device" in capsys.readouterr().err
+
+
+def test_main_analysis_forced_device_and_apply(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that ``--device`` avoids prompts and that ``--apply`` is reported as not implemented yet.
+    """
+    write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device(match={"model": "Other"})]})
+    argv = ["--source", str(analyzed_project / "src"), "--device", "GOPRO9"]
+    assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
+    assert "2 ready" in capsys.readouterr().out
+    assert mr.main(argv + ["--apply"], project_root=analyzed_project, interactive=False) == 1
     assert "not implemented yet" in capsys.readouterr().err
+
+
+def test_main_analysis_missing_exiftool(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that a missing ExifTool stops the analysis with a clear message.
+    """
+    shutil.rmtree(str(analyzed_project / "bin"))
+    code = mr.main(["--source", str(analyzed_project / "src")], project_root=analyzed_project,
+                   environ={"PATH": ""}, interactive=False)
+    assert code == 1
+    assert "ExifTool not found" in capsys.readouterr().err
 
 
 def test_main_rename_invalid_config(checked_project: Path, capsys: pytest.CaptureFixture) -> None:

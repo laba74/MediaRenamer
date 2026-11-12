@@ -43,11 +43,11 @@ Goal: read metadata through ExifTool and match each file to a device.
 - **2.5 Unknown device handling** — Interactive prompt for label and offset, saved to `conf/devices.json`, reused for all matching files of the batch; resolved before any file modification; clear error in non-interactive mode.
 
 ### Done — Epic 2
-- [ ] On a sample folder, discovery returns the expected files (flat and recursive, nested subfolders, relative paths preserved).
-- [ ] Metadata extracted from real JPG, MP4 and RAW samples; missing-date file reported and skipped.
-- [ ] Matching tests: case-insensitivity, serial optional, first match wins, `--device` override.
-- [ ] Unknown device: answer persisted in `conf/devices.json`, no second prompt for the same device, non-interactive run exits with a clear error.
-- [ ] No source file is modified during this epic.
+- [x] On a sample folder, discovery returns the expected files (flat and recursive, nested subfolders, relative paths preserved).
+- [x] Metadata extracted from real JPG, MP4 and RAW samples; missing-date file reported and skipped.
+- [x] Matching tests: case-insensitivity, serial optional, first match wins, `--device` override.
+- [x] Unknown device: answer persisted in `conf/devices.json`, no second prompt for the same device, non-interactive run exits with a clear error.
+- [x] No source file is modified during this epic.
 
 ---
 
