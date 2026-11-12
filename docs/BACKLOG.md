@@ -102,7 +102,7 @@ Goal: execute the plan safely.
 - [x] Integration test with `tmp_path`: in-place rename, copy with sources intact, no overwrite.
 - [x] Integration test with `tmp_path` and `--recursive`: in-place rename keeps subfolders; copy to `--dest` recreates the source tree and creates no empty directory (including subfolders with no supported file).
 - [x] Unknown devices are resolved before the first file operation.
-- [ ] Manual run on a real sample folder gives the expected result.
+- [x] Manual run on a real sample folder gives the expected result.
 
 ---
 
@@ -115,9 +115,9 @@ Goal: clear run summary and a safe log.
 - **6.3 Privacy** — Do not expose unnecessary personal metadata (GPS, serial numbers, etc.) in output or log.
 
 ### Done — Epic 6
-- [ ] Summary matches the actual operations in an integration test.
-- [ ] `.logs/rename.log` created, `.logs/` stays git-ignored.
-- [ ] Test asserting no GPS/serial values appear in logs.
+- [x] Summary matches the actual operations in an integration test.
+- [x] `.logs/rename.log` created, `.logs/` stays git-ignored.
+- [x] Test asserting no GPS/serial values appear in logs.
 
 ---
 

@@ -3,6 +3,7 @@
 import errno
 import io
 import json
+import logging
 import os
 import shutil
 import struct
@@ -2354,8 +2355,257 @@ def test_count_and_print_results() -> None:
         "[RENAMED] a.jpg -> x.jpg",
         "[COPIED]  b.jpg -> y.jpg",
         "[ERROR]   b.jpg -> y.jpg  (target already exists)",
-        "1 renamed, 1 copied, 1 unchanged, 1 skipped, 1 error(s).",
     ]
+
+
+# --- reporting and logging ----------------------------------------------------
+
+
+SERIAL = "C3441325634391"
+GPS_LATITUDE = "45 deg 54 min 12.34 sec N"
+GPS_LONGITUDE = "6 deg 7 min 8.90 sec E"
+
+
+def summary_plan() -> list:
+    """
+    Build a small plan with every kind of entry.
+
+    :return: Plan entries: rename, copy, unchanged, two identical skips and one other skip, one warning.
+    """
+    return [
+        mr.PlanEntry(Path("a.jpg"), Path("x.jpg"), mr.ACTION_RENAME, "", ("ambiguous time",)),
+        mr.PlanEntry(Path("b.jpg"), Path("y.jpg"), mr.ACTION_COPY, "", ()),
+        mr.PlanEntry(Path("x.jpg"), Path("x.jpg"), mr.ACTION_UNCHANGED, "", ()),
+        mr.PlanEntry(Path("c.jpg"), None, mr.ACTION_SKIP, "no date", ()),
+        mr.PlanEntry(Path("d.jpg"), None, mr.ACTION_SKIP, "no date", ()),
+        mr.PlanEntry(Path("e.lrv"), None, mr.ACTION_SKIP, "orphan", ("orphan",)),
+    ]
+
+
+@pytest.fixture
+def memory_logger() -> Any:
+    """
+    Provide the run logger writing to memory at DEBUG level, with a privacy filter.
+
+    :return: Tuple ``(logger, stream)``.
+    """
+    logger = logging.getLogger(mr.LOGGER_NAME)
+    mr.close_logging(logger)
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    handler.addFilter(mr.PrivacyFilter())
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    yield logger, stream
+    mr.close_logging(logger)
+
+
+def test_count_reasons() -> None:
+    """
+    Check that identical reasons are grouped, most frequent first, empty reasons named.
+    """
+    assert mr.count_reasons(["b", "a", "b", ""]) == (("b", 2), ("a", 1), ("no reason given", 1))
+    assert mr.count_reasons([]) == ()
+
+
+def test_summarize_run_preview() -> None:
+    """
+    Check the preview summary: planned operations, skip reasons, warnings, no error.
+    """
+    summary = mr.summarize_run(summary_plan())
+    assert summary.applied is False
+    assert summary.counts == {"renamed": 1, "copied": 1, "unchanged": 1, "skipped": 3, "errors": 0, "warnings": 2}
+    assert summary.skip_reasons == (("no date", 2), ("orphan", 1))
+    assert summary.error_reasons == ()
+
+
+def test_summarize_run_applied() -> None:
+    """
+    Check the summary after execution: failures are counted as errors with their reasons.
+    """
+    plan = summary_plan()
+    results = [
+        mr.OperationResult(plan[0], mr.RESULT_DONE, ""),
+        mr.OperationResult(plan[1], mr.RESULT_FAILED, "target already exists, not overwritten"),
+        mr.OperationResult(plan[2], mr.RESULT_UNCHANGED, "already named"),
+        mr.OperationResult(plan[3], mr.RESULT_SKIPPED, "no date"),
+        mr.OperationResult(plan[4], mr.RESULT_SKIPPED, "no date"),
+        mr.OperationResult(plan[5], mr.RESULT_SKIPPED, "orphan"),
+    ]
+    summary = mr.summarize_run(plan, results)
+    assert summary.applied is True
+    assert summary.counts == {"renamed": 1, "copied": 0, "unchanged": 1, "skipped": 3, "errors": 1, "warnings": 2}
+    assert summary.error_reasons == (("target already exists, not overwritten", 1),)
+
+
+def test_format_and_print_summary() -> None:
+    """
+    Check the summary lines in preview and after execution.
+    """
+    preview = mr.summarize_run(summary_plan())
+    assert mr.format_summary_lines(preview) == [
+        "Summary (preview): 1 to rename, 1 to copy, 1 unchanged, 3 skipped, 2 warning(s).",
+        "  skipped (2): no date",
+        "  skipped (1): orphan",
+    ]
+    applied = mr.RunSummary(True, dict(preview.counts, errors=1), (), (("disk full", 1),))
+    out = io.StringIO()
+    mr.print_summary(applied, out)
+    assert out.getvalue().splitlines() == [
+        "Summary: 1 renamed, 1 copied, 1 unchanged, 3 skipped, 1 error(s), 2 warning(s).",
+        "  error (1): disk full",
+    ]
+
+
+def test_redact_text() -> None:
+    """
+    Check that long secrets are masked case-insensitively and short ones are left alone.
+    """
+    assert mr.redact_text("serial c3441325634391 seen", [SERIAL]) == "serial ***4391 seen"
+    assert mr.redact_text("2024 at 1234", ["1234", ""]) == "2024 at 1234"
+    assert mr.redact_text("ABCDEFGH", ["ABCDEF", "ABCDEFGH"]) == "***EFGH"
+
+
+def test_privacy_filter() -> None:
+    """
+    Check that the filter masks registered values in formatted records and keeps every record.
+    """
+    privacy = mr.PrivacyFilter()
+    privacy.add_secrets([SERIAL, ""])
+    assert privacy.secrets == {SERIAL}
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "device %s", (SERIAL,), None)
+    assert privacy.filter(record) is True
+    assert record.getMessage() == "device ***4391"
+
+
+def test_collect_secrets() -> None:
+    """
+    Check that serial numbers come from the analyses and the device entries.
+    """
+    analysis = mr.FileAnalysis(Path("a.jpg"), mr.STATUS_READY, "", "", None,
+                               mr.DeviceIdentity("GoPro", "HERO9", SERIAL), None)
+    empty = analysis._replace(identity=mr.DeviceIdentity("", "", ""))
+    devices = [make_device(), make_device(match={"serial_number": " 99887766 "}), {"id": "x"}]
+    assert mr.collect_secrets([analysis, empty], devices) == [SERIAL, "99887766"]
+
+
+def test_setup_logging(tmp_path: Path) -> None:
+    """
+    Check that the log file is created, appended to and filtered by level.
+    """
+    logger, error = mr.setup_logging(tmp_path / ".logs", "INFO")
+    assert error is None
+    logger.debug("hidden")
+    logger.info("first %s", SERIAL)
+    mr.get_privacy_filter(logger).add_secrets([SERIAL])
+    logger.info("second %s", SERIAL)
+    logger, _ = mr.setup_logging(tmp_path / ".logs", "INFO")
+    assert len(logger.handlers) == 1
+    logger.warning("third")
+    mr.close_logging(logger)
+    lines = (tmp_path / ".logs" / mr.LOG_FILE_NAME).read_text(encoding="utf-8").splitlines()
+    assert [line.split(" ", 2)[2] for line in lines] == [
+        "INFO first " + SERIAL, "INFO second ***4391", "WARNING third"]
+
+
+def test_setup_logging_unwritable(tmp_path: Path) -> None:
+    """
+    Check that an unusable log folder disables the log file without failing.
+    """
+    blocker = tmp_path / ".logs"
+    blocker.write_text("not a folder", encoding="utf-8")
+    logger, error = mr.setup_logging(blocker, "DEBUG")
+    assert error is not None and "rename.log" in error
+    assert isinstance(logger.handlers[0], logging.NullHandler)
+    logger.info("ignored")
+    mr.close_logging(logger)
+
+
+def test_get_privacy_filter_and_close_logging() -> None:
+    """
+    Check that the privacy filter is found on a handler and that closing removes the handlers.
+    """
+    logger = logging.getLogger(mr.LOGGER_NAME + ".test")
+    assert mr.get_privacy_filter(logger) is None
+    handler = logging.NullHandler()
+    privacy = mr.PrivacyFilter()
+    handler.addFilter(privacy)
+    logger.addHandler(handler)
+    assert mr.get_privacy_filter(logger) is privacy
+    mr.close_logging(logger)
+    assert logger.handlers == []
+
+
+def test_log_plan(memory_logger: Any) -> None:
+    """
+    Check the logged plan: planned operations at DEBUG, skips at INFO, warnings once at WARNING.
+    """
+    logger, stream = memory_logger
+    mr.log_plan(logger, summary_plan())
+    assert stream.getvalue().splitlines() == [
+        "DEBUG plan rename a.jpg -> x.jpg",
+        "WARNING a.jpg: ambiguous time",
+        "DEBUG plan copy b.jpg -> y.jpg",
+        "DEBUG plan unchanged x.jpg -> x.jpg",
+        "INFO skip c.jpg (no date)",
+        "INFO skip d.jpg (no date)",
+        "INFO skip e.lrv (orphan)",
+    ]
+
+
+def test_log_results(memory_logger: Any) -> None:
+    """
+    Check that performed operations are logged at INFO and failures at ERROR.
+    """
+    logger, stream = memory_logger
+    plan = summary_plan()
+    mr.log_results(logger, [
+        mr.OperationResult(plan[0], mr.RESULT_DONE, ""),
+        mr.OperationResult(plan[1], mr.RESULT_DONE, ""),
+        mr.OperationResult(plan[1], mr.RESULT_FAILED, "disk full"),
+        mr.OperationResult(plan[2], mr.RESULT_UNCHANGED, "already named"),
+        mr.OperationResult(plan[3], mr.RESULT_FAILED, "odd"),
+    ])
+    assert stream.getvalue().splitlines() == [
+        "INFO renamed a.jpg -> x.jpg",
+        "INFO copied b.jpg -> y.jpg",
+        "ERROR failed copy b.jpg -> y.jpg (disk full)",
+        "ERROR failed skip c.jpg -> ? (odd)",
+    ]
+
+
+def test_log_summary(memory_logger: Any) -> None:
+    """
+    Check that the summary lines are logged at INFO, without indentation.
+    """
+    logger, stream = memory_logger
+    mr.log_summary(logger, mr.summarize_run(summary_plan()))
+    lines = stream.getvalue().splitlines()
+    assert lines[0].startswith("INFO Summary (preview): 1 to rename")
+    assert lines[1] == "INFO skipped (2): no date"
+
+
+def test_report_error_and_warning(memory_logger: Any, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that errors and warnings go to the standard error stream and to the log.
+    """
+    logger, stream = memory_logger
+    mr.report_error(logger, "bad")
+    mr.report_warning(logger, "odd")
+    assert capsys.readouterr().err.splitlines() == ["[ERROR] bad", "[WARNING] odd"]
+    assert stream.getvalue().splitlines() == ["ERROR bad", "WARNING odd"]
+
+
+def test_load_devices_quietly(tmp_path: Path) -> None:
+    """
+    Check that devices are loaded and that an invalid file gives an empty list.
+    """
+    path = write_json(tmp_path / "devices.json", {"devices": [make_device()]})
+    assert [device["id"] for device in mr.load_devices_quietly(path)] == ["gopro9"]
+    path.write_text("{", encoding="utf-8")
+    assert mr.load_devices_quietly(path) == []
 
 
 # --- real ExifTool integration ------------------------------------------------
@@ -2663,7 +2913,7 @@ def test_main_apply_renames_in_place(analyzed_project: Path, capsys: pytest.Capt
     out = capsys.readouterr().out
     assert plan_lines(out) == previewed
     assert "[RENAMED] a.jpg -> 2024-01-02_02-04-05_GoPro9.jpg" in out
-    assert "2 renamed, 0 copied, 0 unchanged, 0 skipped, 0 error(s)." in out
+    assert "Summary: 2 renamed, 0 copied, 0 unchanged, 0 skipped, 0 error(s), 0 warning(s)." in out
     assert sorted(path.name for path in source.iterdir()) == sorted(previewed.values())
     assert (source / previewed["a.jpg"]).read_bytes() == b"a"
     assert (source / previewed["b.jpg"]).read_bytes() == b"b"
@@ -2874,6 +3124,146 @@ def test_main_rename_invalid_tz(checked_project: Path, capsys: pytest.CaptureFix
     assert "--tz" in capsys.readouterr().err
 
 
+@pytest.fixture
+def private_project(checked_project: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """
+    Prepare a project whose files carry a serial number and GPS coordinates.
+
+    ``src`` holds two dated photos, one photo without date and one orphan ``.LRV``;
+    the device is registered with its serial number and the log level is DEBUG.
+
+    :param checked_project: Project with a fake ExifTool.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :return: Project root.
+    """
+    source = checked_project / "src"
+    source.mkdir()
+    for name in ("a.jpg", "b.jpg", "nodate.jpg", "GL019999.LRV"):
+        (source / name).write_bytes(name.encode("ascii"))
+    tags = {"DateTimeOriginal": "2024:01:02 03:04:05", "Make": "GoPro", "Model": "HERO9 Black",
+            "SerialNumber": SERIAL, "GPSLatitude": GPS_LATITUDE, "GPSLongitude": GPS_LONGITUDE}
+
+    def fake_read_metadata(executable: Path, paths: Any) -> Any:
+        """
+        Return the private tags for every file, without date for ``nodate.jpg``.
+
+        :param executable: Ignored.
+        :param paths: Files to describe.
+        :return: Tuple ``(metadata, errors)``.
+        """
+        found = {}
+        for path in paths:
+            found[path] = {key: value for key, value in tags.items()
+                           if not (path.name == "nodate.jpg" and key == "DateTimeOriginal")}
+        return found, {}
+
+    monkeypatch.setattr(mr, "read_metadata", fake_read_metadata)
+    device = make_device(match={"make": "GoPro", "model": "HERO9 Black", "serial_number": SERIAL})
+    write_json(checked_project / "conf" / "devices.json", {"devices": [device]})
+    config = mr.load_json_file(checked_project / "conf" / "config.json")
+    config["log_level"] = "DEBUG"
+    write_json(checked_project / "conf" / "config.json", config)
+    return checked_project
+
+
+def read_log(project: Path) -> str:
+    """
+    Read the run log of a project.
+
+    :param project: Project root.
+    :return: Content of ``.logs/rename.log``.
+    """
+    return (project / mr.LOGS_DIR_NAME / mr.LOG_FILE_NAME).read_text(encoding="utf-8")
+
+
+def test_main_summary_matches_operations(private_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that the printed and logged summaries match the files actually renamed and skipped.
+    """
+    source = private_project / "src"
+    assert mr.main(["--source", str(source)], project_root=private_project, interactive=False) == 0
+    out = capsys.readouterr().out
+    assert "Summary (preview): 2 to rename, 0 to copy, 0 unchanged, 2 skipped, 1 warning(s)." in out
+    assert mr.main(["--source", str(source), "--apply"], project_root=private_project, interactive=False) == 0
+    out = capsys.readouterr().out
+    names = sorted(path.name for path in source.iterdir())
+    assert names == ["2024-01-02_02-04-05_GoPro9.jpg", "2024-01-02_02-04-05_GoPro9_01.jpg", "GL019999.LRV",
+                     "nodate.jpg"]
+    summary = "Summary: 2 renamed, 0 copied, 0 unchanged, 2 skipped, 0 error(s), 1 warning(s)."
+    assert summary in out
+    assert "  skipped (1): no valid capture date" in out
+    assert "  skipped (1): no main video with the same base name in its folder; not renamed" in out
+    log = read_log(private_project)
+    assert log.count("run started: preview") == 1 and log.count("run started: apply") == 1
+    assert "INFO renamed a.jpg -> 2024-01-02_02-04-05_GoPro9.jpg" in log
+    assert "INFO renamed b.jpg -> 2024-01-02_02-04-05_GoPro9_01.jpg" in log
+    assert "INFO skip nodate.jpg (no valid capture date" in log
+    assert "WARNING GL019999.LRV: no main video" not in log
+    assert "INFO " + summary in log
+    assert "DEBUG plan rename a.jpg" in log
+
+
+def test_main_never_exposes_gps_or_serial(private_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that neither the console nor the DEBUG log shows GPS coordinates or full serial numbers.
+    """
+    source = private_project / "src"
+    assert mr.main(["--source", str(source), "--apply"], project_root=private_project, interactive=False) == 0
+    captured = capsys.readouterr()
+    log = read_log(private_project)
+    for text in (captured.out, captured.err, log):
+        for secret in (SERIAL, GPS_LATITUDE, GPS_LONGITUDE, "GPS"):
+            assert secret not in text
+
+
+def test_main_logs_errors(private_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that a run failing after the configuration is loaded logs its error.
+    """
+    assert mr.main(["--source", str(private_project / "nope")], project_root=private_project) == 1
+    assert "folder not found" in capsys.readouterr().err
+    assert "ERROR --source: folder not found" in read_log(private_project)
+
+
+def test_main_unknown_device_error_masks_serial(
+    private_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """
+    Check that an unregistered device is reported with a masked serial, on the console and in the log.
+    """
+    write_json(private_project / "conf" / "devices.json", {"devices": []})
+    assert mr.main(["--source", str(private_project / "src")], project_root=private_project,
+                   interactive=False) == 1
+    err = capsys.readouterr().err
+    log = read_log(private_project)
+    assert "serial ***4391" in err and "serial ***4391" in log
+    assert SERIAL not in err and SERIAL not in log
+
+
+def test_main_log_file_disabled(private_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that a run goes on with a warning when the log file cannot be created.
+    """
+    (private_project / mr.LOGS_DIR_NAME).write_text("not a folder", encoding="utf-8")
+    assert mr.main(["--source", str(private_project / "src")], project_root=private_project,
+                   interactive=False) == 0
+    captured = capsys.readouterr()
+    assert "[WARNING] Log file disabled" in captured.err
+    assert "Summary (preview)" in captured.out
+
+
+def test_run_batch_invalid_device(private_project: Path, capsys: pytest.CaptureFixture, memory_logger: Any) -> None:
+    """
+    Check that ``run_batch`` reports an unknown ``--device`` id to the console and the log.
+    """
+    logger, stream = memory_logger
+    args = mr.build_arg_parser().parse_args(["--source", "src", "--device", "nope"])
+    config = mr.load_config(private_project / "conf" / "config.json")
+    assert mr.run_batch(args, private_project, config, [], logger) == 1
+    assert "unknown device id" in capsys.readouterr().err
+    assert "ERROR --device: unknown device id 'nope'" in stream.getvalue()
+
+
 # --- repository layout --------------------------------------------------------
 
 
@@ -2892,3 +3282,11 @@ def test_personal_files_are_git_ignored() -> None:
     ignored = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "/conf/config.json" in ignored
     assert "/conf/devices.json" in ignored
+
+
+def test_logs_are_git_ignored() -> None:
+    """
+    Check that the run logs folder is listed in ``.gitignore``.
+    """
+    ignored = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "/.logs/" in ignored

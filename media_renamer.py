@@ -3,6 +3,7 @@
 import argparse
 import errno
 import json
+import logging
 import os
 import re
 import shutil
@@ -63,6 +64,11 @@ EXIFTOOL_SECONDS_PER_FILE = 5
 EXIFTOOL_BATCH_SIZE = 100
 
 LOGS_DIR_NAME = ".logs"
+LOG_FILE_NAME = "rename.log"
+LOGGER_NAME = "media_renamer"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+# Shorter secrets are not redacted from the log: they could match dates or counters.
+MIN_REDACTED_LENGTH = 5
 AUXILIARY_EXTENSIONS = (".lrv", ".thm")
 # GoPro "RAW audio" files (GH<n>.WAV) follow their main video too, but only
 # when their name holds a GoPro file id: other .wav files are regular media.
@@ -184,6 +190,22 @@ class OperationResult(NamedTuple):
     entry: PlanEntry
     status: str
     message: str
+
+
+class RunSummary(NamedTuple):
+    """
+    Counts and reasons of a run, in preview or after execution.
+
+    ``counts`` is keyed by ``renamed``, ``copied``, ``unchanged``, ``skipped``,
+    ``errors`` and ``warnings``; in preview, ``renamed`` and ``copied`` count
+    the planned operations. ``skip_reasons`` and ``error_reasons`` pair each
+    distinct reason with its number of files, most frequent first.
+    """
+
+    applied: bool
+    counts: Dict[str, int]
+    skip_reasons: Tuple[Tuple[str, int], ...]
+    error_reasons: Tuple[Tuple[str, int], ...]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2153,7 +2175,7 @@ def execute_plan(
             else:
                 safe_rename(source, target)
         except FileExistsError:
-            message = "target already exists, not overwritten: {}".format(target)
+            message = "target already exists, not overwritten"
             results.append(OperationResult(entry, RESULT_FAILED, message))
         except OSError as error:
             results.append(OperationResult(entry, RESULT_FAILED, "{}: {}".format(
@@ -2201,9 +2223,259 @@ def print_results(results: Sequence[OperationResult], out: TextIO) -> None:
         if result.message:
             line += "  ({})".format(result.message)
         print(line, file=out)
+
+
+def count_reasons(reasons: Iterable[str]) -> Tuple[Tuple[str, int], ...]:
+    """
+    Count identical reasons.
+
+    :param reasons: One reason per file; empty reasons are counted as ``"no reason given"``.
+    :return: Pairs ``(reason, count)``, most frequent first, then in alphabetical order.
+    """
+    counts = {}  # type: Dict[str, int]
+    for reason in reasons:
+        key = reason or "no reason given"
+        counts[key] = counts.get(key, 0) + 1
+    return tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def summarize_run(entries: Sequence[PlanEntry], results: Optional[Sequence[OperationResult]] = None) -> RunSummary:
+    """
+    Build the run summary from the plan and, after execution, its results.
+
+    Without results (preview), renames and copies are the planned ones and
+    there is no error. Warnings are those attached to the plan entries.
+
+    :param entries: Plan entries.
+    :param results: Operation results; ``None`` in preview.
+    :return: Run summary.
+    """
+    warnings = sum(len(entry.warnings) for entry in entries)
+    if results is None:
+        counts = {"renamed": 0, "copied": 0, "unchanged": 0, "skipped": 0, "errors": 0}
+        names = {ACTION_RENAME: "renamed", ACTION_COPY: "copied", ACTION_UNCHANGED: "unchanged"}
+        for entry in entries:
+            counts[names.get(entry.action, "skipped")] += 1
+        skipped = [entry.message for entry in entries if entry.action not in names]
+        counts["warnings"] = warnings
+        return RunSummary(False, counts, count_reasons(skipped), ())
     counts = count_results(results)
-    print("{renamed} renamed, {copied} copied, {unchanged} unchanged, {skipped} skipped, "
-          "{errors} error(s).".format(**counts), file=out)
+    counts["warnings"] = warnings
+    skipped = [result.message for result in results if result.status == RESULT_SKIPPED]
+    failed = [result.message for result in results if result.status == RESULT_FAILED]
+    return RunSummary(True, counts, count_reasons(skipped), count_reasons(failed))
+
+
+def format_summary_lines(summary: RunSummary) -> List[str]:
+    """
+    Format a run summary for the console and the log.
+
+    :param summary: Run summary.
+    :return: A counts line, then one line per skip or error reason.
+    """
+    counts = summary.counts
+    if summary.applied:
+        line = "Summary: {renamed} renamed, {copied} copied, {unchanged} unchanged, {skipped} skipped, " \
+               "{errors} error(s), {warnings} warning(s).".format(**counts)
+    else:
+        line = "Summary (preview): {renamed} to rename, {copied} to copy, {unchanged} unchanged, " \
+               "{skipped} skipped, {warnings} warning(s).".format(**counts)
+    lines = [line]
+    lines.extend("  skipped ({}): {}".format(count, reason) for reason, count in summary.skip_reasons)
+    lines.extend("  error ({}): {}".format(count, reason) for reason, count in summary.error_reasons)
+    return lines
+
+
+def print_summary(summary: RunSummary, out: TextIO) -> None:
+    """
+    Print a run summary.
+
+    :param summary: Run summary.
+    :param out: Output stream.
+    """
+    for line in format_summary_lines(summary):
+        print(line, file=out)
+
+
+def redact_text(text: str, secrets: Iterable[str]) -> str:
+    """
+    Mask every occurrence of personal values (such as serial numbers) in a text.
+
+    Values shorter than ``MIN_REDACTED_LENGTH`` are left alone: they could match
+    ordinary text such as dates. Matching ignores case.
+
+    :param text: Text to clean.
+    :param secrets: Values to hide.
+    :return: Text where each value is replaced by its masked form (see ``mask_serial``).
+    """
+    for secret in sorted({value for value in secrets if len(value) >= MIN_REDACTED_LENGTH}, key=len, reverse=True):
+        text = re.sub(re.escape(secret), mask_serial(secret), text, flags=re.IGNORECASE)
+    return text
+
+
+class PrivacyFilter(logging.Filter):
+    """Logging filter masking personal values (such as serial numbers) in every record."""
+
+    def __init__(self) -> None:
+        """
+        Create a filter without any value to hide.
+        """
+        super().__init__()
+        self.secrets = set()  # type: Set[str]
+
+    def add_secrets(self, values: Iterable[str]) -> None:
+        """
+        Register more values to hide.
+
+        :param values: Values to hide; empty values are ignored.
+        """
+        self.secrets.update(value for value in values if value)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """
+        Replace the message of a record by its redacted form.
+
+        :param record: Log record, modified in place.
+        :return: Always ``True``: records are cleaned, never dropped.
+        """
+        record.msg = redact_text(record.getMessage(), self.secrets)
+        record.args = None
+        return True
+
+
+def collect_secrets(analyses: Iterable[FileAnalysis], devices: Iterable[Mapping[str, Any]]) -> List[str]:
+    """
+    List the personal values that must never appear in the log.
+
+    :param analyses: File analyses (their serial numbers are collected).
+    :param devices: Device entries (their ``match.serial_number`` values are collected).
+    :return: Non-empty serial numbers.
+    """
+    found = [analysis.identity.serial_number for analysis in analyses]
+    found.extend(clean_text((device.get("match") or {}).get("serial_number")) for device in devices)
+    return [value for value in found if value]
+
+
+def setup_logging(log_dir: Path, level: str) -> Tuple[logging.Logger, Optional[str]]:
+    """
+    Configure the run logger, appending to ``<log_dir>/rename.log``.
+
+    Handlers from a previous run are closed first. A privacy filter masks the
+    values registered with ``add_secrets`` on it. When the log file cannot be
+    opened, the run goes on without a log file.
+
+    :param log_dir: Folder of the log file, created if needed.
+    :param level: Validated ``log_level`` of ``conf/config.json``.
+    :return: Tuple ``(logger, error)``; ``error`` describes why the log file could not be opened, else ``None``.
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+    close_logging(logger)
+    logger.setLevel(level)
+    logger.propagate = False
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(str(log_dir / LOG_FILE_NAME), encoding="utf-8")  # type: logging.Handler
+        error = None
+    except OSError as exc:
+        handler = logging.NullHandler()
+        error = "cannot write {}: {}".format(log_dir / LOG_FILE_NAME, exc.strerror or exc)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    handler.addFilter(PrivacyFilter())
+    logger.addHandler(handler)
+    return logger, error
+
+
+def get_privacy_filter(logger: logging.Logger) -> Optional[PrivacyFilter]:
+    """
+    Find the privacy filter installed by ``setup_logging``.
+
+    :param logger: Run logger.
+    :return: The first privacy filter of the logger's handlers, or ``None``.
+    """
+    for handler in logger.handlers:
+        for item in handler.filters:
+            if isinstance(item, PrivacyFilter):
+                return item
+    return None
+
+
+def close_logging(logger: logging.Logger) -> None:
+    """
+    Close and remove every handler of a logger.
+
+    :param logger: Logger to clean up.
+    """
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+
+def log_plan(logger: logging.Logger, entries: Sequence[PlanEntry]) -> None:
+    """
+    Log the plan: planned operations at DEBUG, skips at INFO, warnings at WARNING.
+
+    :param logger: Run logger.
+    :param entries: Plan entries.
+    """
+    for entry in entries:
+        source = entry.source.as_posix()
+        if entry.target is None:
+            logger.info("skip %s (%s)", source, entry.message or "no reason given")
+        else:
+            logger.debug("plan %s %s -> %s", entry.action, source, entry.target.as_posix())
+        for warning in entry.warnings:
+            if warning != entry.message or entry.target is not None:
+                logger.warning("%s: %s", source, warning)
+
+
+def log_results(logger: logging.Logger, results: Sequence[OperationResult]) -> None:
+    """
+    Log the performed operations at INFO and the failed ones at ERROR.
+
+    :param logger: Run logger.
+    :param results: Operation results.
+    """
+    names = {ACTION_RENAME: "renamed", ACTION_COPY: "copied"}
+    for result in results:
+        entry = result.entry
+        target = entry.target.as_posix() if entry.target is not None else "?"
+        if result.status == RESULT_DONE:
+            logger.info("%s %s -> %s", names.get(entry.action, entry.action), entry.source.as_posix(), target)
+        elif result.status == RESULT_FAILED:
+            logger.error("failed %s %s -> %s (%s)", entry.action, entry.source.as_posix(), target, result.message)
+
+
+def log_summary(logger: logging.Logger, summary: RunSummary) -> None:
+    """
+    Log a run summary at INFO.
+
+    :param logger: Run logger.
+    :param summary: Run summary.
+    """
+    for line in format_summary_lines(summary):
+        logger.info("%s", line.strip())
+
+
+def report_error(logger: logging.Logger, message: str) -> None:
+    """
+    Print an error on the standard error stream and log it.
+
+    :param logger: Run logger.
+    :param message: Error message.
+    """
+    print("[ERROR] {}".format(message), file=sys.stderr)
+    logger.error("%s", message)
+
+
+def report_warning(logger: logging.Logger, message: str) -> None:
+    """
+    Print a warning on the standard error stream and log it.
+
+    :param logger: Run logger.
+    :param message: Warning message.
+    """
+    print("[WARNING] {}".format(message), file=sys.stderr)
+    logger.warning("%s", message)
 
 
 def run_check(
@@ -2266,6 +2538,103 @@ def run_check(
     return 1 if failed else 0
 
 
+def load_devices_quietly(path: Path) -> List[Dict[str, Any]]:
+    """
+    Load the device entries, ignoring any error.
+
+    Used to learn the serial numbers registered during the run, so they can be hidden from the log.
+
+    :param path: Path of ``conf/devices.json``.
+    :return: Device entries, or an empty list when the file cannot be loaded.
+    """
+    try:
+        return load_devices(path)
+    except ConfigError:
+        return []
+
+
+def run_batch(
+    args: argparse.Namespace,
+    root: Path,
+    config: Dict[str, Any],
+    devices: List[Dict[str, Any]],
+    logger: logging.Logger,
+    environ: Optional[Mapping[str, str]] = None,
+    interactive: bool = False,
+    input_func: Callable[[str], str] = input,
+) -> int:
+    """
+    Analyze the source folder, print the plan and, when requested, execute it.
+
+    Every step is logged; the run ends with a summary on the console and in the log.
+
+    :param args: Parsed command line arguments.
+    :param root: Project folder containing ``conf/`` and ``bin/``.
+    :param config: Validated ``conf/config.json``.
+    :param devices: Validated device entries.
+    :param logger: Run logger set up by ``setup_logging``.
+    :param environ: Environment variables; ``os.environ`` when ``None``.
+    :param interactive: Whether unknown devices can be asked to the user.
+    :param input_func: Function reading one line, such as ``input``.
+    :return: Process exit code (0 on success).
+    """
+    devices_path = root / CONF_DIR_NAME / DEVICES_FILE_NAME
+    privacy = get_privacy_filter(logger) or PrivacyFilter()
+    privacy.add_secrets(collect_secrets((), devices))
+    if args.tz is not None:
+        tz_error, tz_warning = check_cli_timezone(args.tz)
+        if tz_error:
+            report_error(logger, "--tz: {}".format(tz_error))
+            return 1
+        if tz_warning:
+            report_warning(logger, "--tz: {}".format(tz_warning))
+    elif any(device.get("timezone") for device in devices) and not has_timezone_database():
+        report_warning(logger, "Device time zones ignored, local times kept: {}".format(
+            describe_missing_timezone_database()))
+    forced_device = None
+    if args.device is not None:
+        forced_device = find_device(devices, args.device)
+        if forced_device is None:
+            report_error(logger, "--device: unknown device id {!r}".format(args.device))
+            return 1
+    source = Path(args.source)
+    if not source.is_dir():
+        report_error(logger, "--source: folder not found: {}".format(source))
+        return 1
+    dest_root = Path(args.dest) if args.dest else None
+    applied = should_apply(args.apply, args.dry_run, config["dry_run_by_default"])
+    logger.info("run started: %s, source %s%s%s", "apply" if applied else "preview", source,
+                ", destination {}".format(dest_root) if dest_root else "", ", recursive" if args.recursive else "")
+    excluded = [root / LOGS_DIR_NAME] + ([dest_root] if dest_root else [])
+    try:
+        executable = find_exiftool(root / BIN_DIR_NAME, environ)
+        analyses = analyze_source(
+            source, config["supported_extensions"], devices, devices_path, executable,
+            args.recursive, forced_device, excluded, interactive, input_func, cli_tz=args.tz,
+        )
+    except (ConfigError, ExifToolError, UnknownDeviceError) as error:
+        report_error(logger, str(error))
+        return 1
+    # Devices registered during the run may hold serial numbers too.
+    privacy.add_secrets(collect_secrets(analyses, load_devices_quietly(devices_path)))
+    print_analysis(analyses, sys.stdout)
+    # The same plan is printed and executed, so preview and apply always agree.
+    plan = build_plan(analyses, config["filename_pattern"], source, dest_root)
+    print_plan(plan, sys.stdout)
+    log_plan(logger, plan)
+    results = None  # type: Optional[List[OperationResult]]
+    if applied:
+        results = execute_plan(plan, source, dest_root)
+        print_results(results, sys.stdout)
+        log_results(logger, results)
+    summary = summarize_run(plan, results)
+    print_summary(summary, sys.stdout)
+    log_summary(logger, summary)
+    if not applied:
+        print("Preview only: no file was changed. Use --apply to perform these operations.")
+    return 1 if summary.counts["errors"] else 0
+
+
 def main(
     argv: Optional[List[str]] = None,
     project_root: Optional[Path] = None,
@@ -2303,48 +2672,14 @@ def main(
     except ConfigError as error:
         print("[ERROR] {}".format(error), file=sys.stderr)
         return 1
-    if args.tz is not None:
-        tz_error, tz_warning = check_cli_timezone(args.tz)
-        if tz_error:
-            print("[ERROR] --tz: {}".format(tz_error), file=sys.stderr)
-            return 1
-        if tz_warning:
-            print("[WARNING] --tz: {}".format(tz_warning), file=sys.stderr)
-    elif any(device.get("timezone") for device in devices) and not has_timezone_database():
-        print("[WARNING] Device time zones ignored, local times kept: {}".format(
-            describe_missing_timezone_database()), file=sys.stderr)
-    forced_device = None
-    if args.device is not None:
-        forced_device = find_device(devices, args.device)
-        if forced_device is None:
-            print("[ERROR] --device: unknown device id {!r}".format(args.device), file=sys.stderr)
-            return 1
-    source = Path(args.source)
-    if not source.is_dir():
-        print("[ERROR] --source: folder not found: {}".format(source), file=sys.stderr)
-        return 1
-    excluded = [root / LOGS_DIR_NAME] + ([Path(args.dest)] if args.dest else [])
+    logger, log_error = setup_logging(root / LOGS_DIR_NAME, config["log_level"])
+    if log_error:
+        print("[WARNING] Log file disabled: {}".format(log_error), file=sys.stderr)
     is_interactive = sys.stdin.isatty() if interactive is None else interactive
     try:
-        executable = find_exiftool(root / BIN_DIR_NAME, environ)
-        analyses = analyze_source(
-            source, config["supported_extensions"], devices, conf_dir / DEVICES_FILE_NAME, executable,
-            args.recursive, forced_device, excluded, is_interactive, input_func, cli_tz=args.tz,
-        )
-    except (ConfigError, ExifToolError, UnknownDeviceError) as error:
-        print("[ERROR] {}".format(error), file=sys.stderr)
-        return 1
-    print_analysis(analyses, sys.stdout)
-    dest_root = Path(args.dest) if args.dest else None
-    # The same plan is printed and executed, so preview and apply always agree.
-    plan = build_plan(analyses, config["filename_pattern"], source, dest_root)
-    print_plan(plan, sys.stdout)
-    if not should_apply(args.apply, args.dry_run, config["dry_run_by_default"]):
-        print("Preview only: no file was changed. Use --apply to perform these operations.")
-        return 0
-    results = execute_plan(plan, source, dest_root)
-    print_results(results, sys.stdout)
-    return 1 if count_results(results)["errors"] else 0
+        return run_batch(args, root, config, devices, logger, environ, is_interactive, input_func)
+    finally:
+        close_logging(logger)
 
 
 if __name__ == "__main__":
