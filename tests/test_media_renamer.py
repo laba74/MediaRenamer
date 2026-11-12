@@ -1814,6 +1814,291 @@ def test_add_effective_dates() -> None:
     assert ready.effective is None
 
 
+# --- rename plan --------------------------------------------------------------
+
+
+PATTERN = "{YYYY}-{MM}-{DD}_{HH}-{MIN}-{SEC}_{DEVICE}"
+BASE = "2024-01-02_03-04-05_GoPro9"
+WHEN = datetime(2024, 1, 2, 3, 4, 5)
+
+
+def ready(name: str, when: datetime = WHEN, label: str = "GoPro9", warnings: Any = ()) -> mr.FileAnalysis:
+    """
+    Build the analysis of a ready file with an effective date.
+
+    :param name: Relative path of the file.
+    :param when: Effective date.
+    :param label: Device label.
+    :param warnings: Warnings of the effective date.
+    :return: File analysis.
+    """
+    return mr.FileAnalysis(Path(name), mr.STATUS_READY, "", "DateTimeOriginal", when,
+                           mr.DeviceIdentity("GoPro", "HERO9 Black", ""), make_device(label=label),
+                           mr.EffectiveDate(when, "", "", tuple(warnings)))
+
+
+def auxiliary(name: str) -> mr.FileAnalysis:
+    """
+    Build the analysis of a GoPro auxiliary file.
+
+    :param name: Relative path of the file.
+    :return: File analysis.
+    """
+    return mr.analyze_file(Path(name), None, None, [])
+
+
+def skipped(name: str) -> mr.FileAnalysis:
+    """
+    Build the analysis of a skipped file.
+
+    :param name: Relative path of the file.
+    :return: File analysis.
+    """
+    return mr.analyze_file(Path(name), {"Model": "HERO9 Black"}, None, [make_device()])
+
+
+def targets(entries: Any) -> Dict[str, Optional[str]]:
+    """
+    Map each planned source to its target, as POSIX strings.
+
+    :param entries: Plan entries.
+    :return: Mapping of source to target (``None`` when skipped).
+    """
+    return {entry.source.as_posix(): entry.target.as_posix() if entry.target else None for entry in entries}
+
+
+def test_sanitize_stem() -> None:
+    """
+    Check the deterministic replacement of invalid characters, dots, spaces and reserved names.
+    """
+    assert mr.sanitize_stem("a<b>c:d\"e/f\\g|h?i*j\tk") == "a_b_c_d_e_f_g_h_i_j_k"
+    assert mr.sanitize_stem(" ..name.. ") == "name"
+    assert mr.sanitize_stem(" . ") == "_"
+    assert mr.sanitize_stem("con") == "_con" and mr.sanitize_stem("COM1.x") == "_COM1.x"
+    assert mr.sanitize_stem("CONSOLE") == "CONSOLE"
+    assert mr.sanitize_stem("été 2024") == "été 2024"
+
+
+def test_render_stem() -> None:
+    """
+    Check every token, zero padding and the sanitizing of token values.
+    """
+    date = datetime(987, 6, 5, 4, 3, 2)
+    pattern = "{YYYY}{MM}{DD}-{HH}{MIN}{SEC}_{DEVICE}_{ORIGINAL}"
+    assert mr.render_stem(pattern, date, "Cam", "GOPR0001") == "09870605-040302_Cam_GOPR0001"
+    assert mr.render_stem("{ORIGINAL}_{DEVICE}", date, "Cam", "a:b") == "a_b_Cam"
+    with pytest.raises(ValueError, match="unknown token"):
+        mr.render_stem("{YEAR}", date, "Cam", "x")
+
+
+def test_build_target_stem() -> None:
+    """
+    Check that the effective date is used, with a fallback on the capture date.
+    """
+    analysis = ready("a.jpg")._replace(effective=mr.EffectiveDate(datetime(2025, 5, 6, 7, 8, 9), "", "", ()))
+    assert mr.build_target_stem(analysis, PATTERN) == "2025-05-06_07-08-09_GoPro9"
+    assert mr.build_target_stem(ready("a.jpg")._replace(effective=None), PATTERN) == BASE
+    with pytest.raises(ValueError, match="no date or device"):
+        mr.build_target_stem(ready("a.jpg")._replace(device=None), PATTERN)
+
+
+def test_folder_key() -> None:
+    """
+    Check that folder keys ignore case and the file name.
+    """
+    assert mr.folder_key(Path("Sub/A.jpg")) == mr.folder_key(Path("sub/b.JPG")) == "sub"
+    assert mr.folder_key(Path("a.jpg")) == "."
+
+
+def test_main_video_stems() -> None:
+    """
+    Check the same-name candidate and the GoPro GL to GH/GX candidates.
+    """
+    assert mr.main_video_stems("GOPR0001") == ["gopr0001"]
+    assert mr.main_video_stems("GL010001") == ["gl010001", "gh010001", "gx010001"]
+
+
+def test_group_auxiliaries() -> None:
+    """
+    Check pairing in the same folder, GoPro GL names, orphans and duplicate extensions.
+    """
+    analyses = [
+        ready("GH010001.MP4"), auxiliary("GL010001.LRV"), auxiliary("GH010001.THM"),
+        auxiliary("GX010001.THM"), ready("GX010001.MP4"), auxiliary("sub/GH010001.THM"),
+        skipped("GOPR0002.MP4"), auxiliary("GOPR0002.THM"), ready("GOPR0003.JPG"), auxiliary("GOPR0003.THM"),
+        auxiliary("GL010009.LRV"), auxiliary("GL010009.THM"),
+    ]
+    groups, orphans = mr.group_auxiliaries(analyses)
+    assert {main.as_posix(): [aux.relative.name for aux in auxes] for main, auxes in groups.items()} == {
+        "GH010001.MP4": ["GL010001.LRV", "GH010001.THM"], "GX010001.MP4": ["GX010001.THM"]}
+    assert "no main video" in orphans[Path("sub/GH010001.THM")]
+    assert "is skipped" in orphans[Path("GOPR0002.THM")]
+    assert "no main video" in orphans[Path("GOPR0003.THM")]
+    assert "no main video" in orphans[Path("GL010009.LRV")]
+    assert len(orphans) == 5
+
+
+def test_group_auxiliaries_duplicate_extension() -> None:
+    """
+    Check that a main video takes only one auxiliary file per extension.
+    """
+    analyses = [ready("GH010001.MP4"), auxiliary("GH010001.LRV"), auxiliary("GL010001.LRV")]
+    groups, orphans = mr.group_auxiliaries(analyses)
+    assert [aux.relative.name for aux in groups[Path("GH010001.MP4")]] == ["GH010001.LRV"]
+    assert "already follows GH010001.MP4" in orphans[Path("GL010001.LRV")]
+
+
+def test_list_existing_names(tmp_path: Path) -> None:
+    """
+    Check that names are case-folded and that a missing folder is empty.
+    """
+    (tmp_path / "A.JPG").write_bytes(b"")
+    (tmp_path / "Sub").mkdir()
+    assert mr.list_existing_names(tmp_path) == {"a.jpg", "sub"}
+    assert mr.list_existing_names(tmp_path / "missing") == set()
+
+
+def test_resolve_collision() -> None:
+    """
+    Check the suffixes, case-insensitive comparisons, own names and multi-extension groups.
+    """
+    assert mr.resolve_collision("x", [".jpg"], set(), set(), set()) == "x"
+    assert mr.resolve_collision("x", [".JPG"], {"x.jpg"}, set(), set()) == "x_01"
+    assert mr.resolve_collision("x", [".jpg"], {"x.jpg"}, {"x_01.jpg"}, set()) == "x_02"
+    assert mr.resolve_collision("x", [".jpg"], set(), {"x.jpg"}, {"x.jpg"}) == "x"
+    assert mr.resolve_collision("x", [".mp4", ".thm"], set(), {"x.thm"}, set()) == "x_01"
+    taken = {"x.jpg"} | {"x_{:02d}.jpg".format(index) for index in range(1, 100)}
+    assert mr.resolve_collision("x", [".jpg"], taken, set(), set()) == "x_100"
+
+
+def test_build_plan_is_deterministic(tmp_path: Path) -> None:
+    """
+    Check that the same input, in any order, always yields the same plan.
+    """
+    analyses = [ready("b.jpg"), ready("A.jpg"), ready("sub/c.mp4"), auxiliary("sub/c.thm"), ready("a2.jpg"),
+                skipped("z.mp4")]
+    first = mr.build_plan(analyses, PATTERN, tmp_path)
+    assert mr.build_plan(list(reversed(analyses)), PATTERN, tmp_path) == first
+    assert mr.build_plan(analyses, PATTERN, tmp_path) == first
+    assert [entry.source.as_posix() for entry in first] == ["A.jpg", "a2.jpg", "b.jpg", "sub/c.mp4",
+                                                             "sub/c.thm", "z.mp4"]
+    assert all(isinstance(entry, mr.PlanEntry) for entry in first)
+    with pytest.raises(AttributeError):
+        first[0].target = None  # type: ignore[misc]
+
+
+def test_build_plan_collisions_inside_batch(tmp_path: Path) -> None:
+    """
+    Check suffixes for identical names and for names differing only by case.
+    """
+    analyses = [ready("a.jpg"), ready("b.jpg"), ready("c.JPG"), ready("d.png"),
+                ready("e.jpg", label="gopro9")]
+    assert targets(mr.build_plan(analyses, PATTERN, tmp_path)) == {
+        "a.jpg": BASE + ".jpg", "b.jpg": BASE + "_01.jpg", "c.JPG": BASE + "_02.JPG", "d.png": BASE + ".png",
+        "e.jpg": "2024-01-02_03-04-05_gopro9_03.jpg"}
+
+
+def test_build_plan_collisions_with_existing_files(tmp_path: Path) -> None:
+    """
+    Check that existing files are never targeted, whatever their case, in place and in copy mode.
+    """
+    (tmp_path / (BASE.upper() + ".JPG")).write_bytes(b"")
+    (tmp_path / (BASE + "_01.jpg")).write_bytes(b"")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / (BASE + ".jpg")).write_bytes(b"")
+    plan = mr.build_plan([ready("a.jpg")], PATTERN, tmp_path)
+    assert plan[0].target == Path(BASE + "_02.jpg") and plan[0].action == mr.ACTION_RENAME
+    plan = mr.build_plan([ready("a.jpg")], PATTERN, tmp_path, dest)
+    assert plan[0].target == Path(BASE + "_01.jpg") and plan[0].action == mr.ACTION_COPY
+
+
+def test_build_plan_keeps_own_name(tmp_path: Path) -> None:
+    """
+    Check that an already renamed file keeps its name in place, and may change only its case.
+    """
+    (tmp_path / (BASE + ".jpg")).write_bytes(b"")
+    (tmp_path / "2024-01-02_03-04-05_GOPRO9.png").write_bytes(b"")
+    plan = mr.build_plan([ready(BASE + ".jpg"), ready("2024-01-02_03-04-05_GOPRO9.png")], PATTERN, tmp_path)
+    assert [(entry.target.name, entry.action) for entry in plan] == [
+        (BASE + ".jpg", mr.ACTION_UNCHANGED), (BASE + ".png", mr.ACTION_RENAME)]
+    copy = mr.build_plan([ready(BASE + ".jpg")], PATTERN, tmp_path, tmp_path / "out")
+    assert copy[0].action == mr.ACTION_COPY and copy[0].target == Path(BASE + ".jpg")
+
+
+def test_build_plan_auxiliary_files_follow_main_video(tmp_path: Path) -> None:
+    """
+    Check that ``.LRV``/``.THM`` take the final name of their main video, collision suffix included.
+    """
+    (tmp_path / (BASE + ".THM")).write_bytes(b"")
+    analyses = [ready("GH010001.MP4", warnings=["dst"]), auxiliary("GL010001.LRV"), auxiliary("GH010001.THM"),
+                auxiliary("GOPR0009.THM")]
+    plan = mr.build_plan(analyses, PATTERN, tmp_path)
+    assert targets(plan) == {"GH010001.MP4": BASE + "_01.MP4", "GL010001.LRV": BASE + "_01.LRV",
+                             "GH010001.THM": BASE + "_01.THM", "GOPR0009.THM": None}
+    by_source = {entry.source.name: entry for entry in plan}
+    assert by_source["GL010001.LRV"].message == "follows GH010001.MP4"
+    assert by_source["GL010001.LRV"].warnings == ("dst",)
+    orphan = by_source["GOPR0009.THM"]
+    assert orphan.action == mr.ACTION_SKIP and "no main video" in orphan.warnings[0]
+
+
+def test_build_plan_subfolders_are_independent(tmp_path: Path) -> None:
+    """
+    Check that the same base name in two subfolders gives no cross-folder pairing or suffix.
+    """
+    analyses = [ready("a/GH010001.MP4"), auxiliary("a/GH010001.THM"), ready("b/GH010001.MP4"),
+                auxiliary("c/GH010001.THM")]
+    plan = mr.build_plan(analyses, PATTERN, tmp_path)
+    assert targets(plan) == {"a/GH010001.MP4": "a/" + BASE + ".MP4", "a/GH010001.THM": "a/" + BASE + ".THM",
+                             "b/GH010001.MP4": "b/" + BASE + ".MP4", "c/GH010001.THM": None}
+
+
+def test_build_plan_skips(tmp_path: Path) -> None:
+    """
+    Check the entries of skipped files and of files whose name cannot be built.
+    """
+    analyses = [skipped("a.mp4"), ready("b.jpg")._replace(device=None)]
+    plan = mr.build_plan(analyses, PATTERN, tmp_path)
+    assert [(entry.action, entry.target) for entry in plan] == [(mr.ACTION_SKIP, None)] * 2
+    assert "no valid capture date" in plan[0].message and "no date or device" in plan[1].message
+
+
+def test_build_plan_touches_no_file(media_tree: Path) -> None:
+    """
+    Check that building a plan, in place or with a destination, creates or changes nothing.
+    """
+    before = snapshot(media_tree)
+    folders = sorted(path for path in media_tree.rglob("*") if path.is_dir())
+    analyses = [ready("a.mp4"), ready("b.JPG"), ready("sub/c.jpg")]
+    mr.build_plan(analyses, PATTERN, media_tree)
+    mr.build_plan(analyses, PATTERN, media_tree, media_tree / "new" / "dest")
+    assert snapshot(media_tree) == before
+    assert sorted(path for path in media_tree.rglob("*") if path.is_dir()) == folders
+
+
+def test_print_plan() -> None:
+    """
+    Check the printed actions, targets, messages and warnings.
+    """
+    entries = [
+        mr.PlanEntry(Path("sub/a.jpg"), Path("sub/x.jpg"), mr.ACTION_RENAME, "", ("dst gap",)),
+        mr.PlanEntry(Path("a.thm"), Path("x.thm"), mr.ACTION_COPY, "follows a.mp4", ()),
+        mr.PlanEntry(Path("x.jpg"), Path("x.jpg"), mr.ACTION_UNCHANGED, "", ()),
+        mr.PlanEntry(Path("b.thm"), None, mr.ACTION_SKIP, "orphan", ("orphan",)),
+    ]
+    out = io.StringIO()
+    mr.print_plan(entries, out)
+    assert out.getvalue().splitlines() == [
+        "Rename plan:",
+        "[RENAME] sub/a.jpg -> sub/x.jpg",
+        "         warning: dst gap",
+        "[COPY]   a.thm -> x.thm  (follows a.mp4)",
+        "[SAME]   x.jpg -> x.jpg",
+        "[SKIP]   b.thm  (orphan)",
+    ]
+
+
 # --- real ExifTool integration ------------------------------------------------
 
 
@@ -2045,8 +2330,26 @@ def test_main_analysis_prompts_once_and_saves(analyzed_project: Path, capsys: py
     assert code == 0
     out = capsys.readouterr().out
     assert "[OK]   a.jpg" in out and "device 'GoPro9'" in out and "2 ready" in out
+    assert "[RENAME] a.jpg -> 2024-01-02_02-04-05_GoPro9.jpg" in out
+    assert "[RENAME] b.jpg -> 2024-01-02_02-04-05_GoPro9_01.jpg" in out
     devices = mr.load_devices(analyzed_project / "conf" / "devices.json")
     assert [device["id"] for device in devices] == ["gopro9"]
+
+
+def test_main_analysis_prints_copy_plan(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
+    """
+    Check that ``--dest`` plans copies without creating the destination or touching the sources.
+    """
+    write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
+    dest = analyzed_project / "dest"
+    before = snapshot(analyzed_project / "src")
+    argv = ["--source", str(analyzed_project / "src"), "--dest", str(dest)]
+    assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
+    out = capsys.readouterr().out
+    assert "[COPY]   a.jpg -> 2024-01-02_02-04-05_GoPro9.jpg" in out
+    assert "[COPY]   b.jpg -> 2024-01-02_02-04-05_GoPro9_01.jpg" in out
+    assert not dest.exists()
+    assert snapshot(analyzed_project / "src") == before
 
 
 def test_main_analysis_non_interactive_unknown_device(

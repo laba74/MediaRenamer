@@ -78,11 +78,11 @@ Goal: build the target names once, shared by preview and apply.
 - **4.4 Plan model** — Immutable plan entries (source, target, action, warnings) produced by a single function.
 
 ### Done — Epic 4
-- [ ] Same input always yields the same plan (determinism test).
-- [ ] Tests: collisions inside the batch, with existing files, case-only differences.
-- [ ] Tests: `.LRV`/`.THM` follow the main video; orphan auxiliary is warned and not renamed.
-- [ ] Tests: same base name in two different subfolders yields no cross-folder pairing and no cross-folder collision suffix.
-- [ ] Plan generation touches no file.
+- [x] Same input always yields the same plan (determinism test).
+- [x] Tests: collisions inside the batch, with existing files, case-only differences.
+- [x] Tests: `.LRV`/`.THM` follow the main video; orphan auxiliary is warned and not renamed.
+- [x] Tests: same base name in two different subfolders yields no cross-folder pairing and no cross-folder collision suffix.
+- [x] Plan generation touches no file.
 
 ---
 

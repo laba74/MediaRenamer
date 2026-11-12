@@ -92,6 +92,22 @@ STATUS_SKIPPED = "skipped"
 STATUS_UNKNOWN_DEVICE = "unknown_device"
 DEFAULT_OFFSET = "+00:00:00"
 
+ACTION_RENAME = "rename"
+ACTION_COPY = "copy"
+ACTION_UNCHANGED = "unchanged"
+ACTION_SKIP = "skip"
+# Extensions of the main videos that GoPro auxiliary files (.LRV, .THM) follow.
+MAIN_VIDEO_EXTENSIONS = (".mp4", ".mov")
+# GoPro HERO6+ names the low-resolution video GL<n>.LRV next to GH<n>.MP4 / GX<n>.MP4.
+GOPRO_LRV_PREFIX = "gl"
+GOPRO_VIDEO_PREFIXES = ("gh", "gx")
+WINDOWS_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM{}".format(index) for index in range(1, 10)]
+    + ["LPT{}".format(index) for index in range(1, 10)]
+)
+COLLISION_SUFFIX_FORMAT = "_{:02d}"
+
 
 class ConfigError(Exception):
     """Raised when a configuration file is missing, unreadable or invalid."""
@@ -133,6 +149,21 @@ class FileAnalysis(NamedTuple):
     identity: DeviceIdentity
     device: Optional[Dict[str, Any]]
     effective: Optional[EffectiveDate] = None
+
+
+class PlanEntry(NamedTuple):
+    """
+    One immutable step of the rename plan.
+
+    ``source`` is relative to the source folder and ``target`` relative to the
+    target folder (the source folder in place, the destination with ``--dest``).
+    """
+
+    source: Path
+    target: Optional[Path]
+    action: str
+    message: str
+    warnings: Tuple[str, ...]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1648,6 +1679,282 @@ def print_analysis(analyses: Sequence[FileAnalysis], out: TextIO) -> None:
         len(analyses) - counts.get(STATUS_READY, 0) - counts.get(STATUS_AUXILIARY, 0), warnings), file=out)
 
 
+def sanitize_stem(stem: str) -> str:
+    """
+    Turn a rendered name (without extension) into a valid file name, deterministically.
+
+    Invalid file name characters and control characters become ``_``; leading
+    and trailing dots and spaces are removed; an empty result becomes ``_``; a
+    Windows reserved device name (``CON``, ``NUL``, ``COM1``...) is prefixed with ``_``.
+
+    :param stem: Rendered name, without extension.
+    :return: Sanitized name.
+    """
+    cleaned = "".join("_" if char in INVALID_FILENAME_CHARS or ord(char) < 32 else char for char in stem)
+    cleaned = cleaned.strip(" .") or "_"
+    if cleaned.split(".")[0].rstrip(" ").upper() in WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned
+    return cleaned
+
+
+def render_stem(pattern: str, date: datetime, label: str, original: str) -> str:
+    """
+    Render the file name pattern, without extension.
+
+    :param pattern: Validated ``filename_pattern``, e.g. ``"{YYYY}-{MM}-{DD}_{DEVICE}"``.
+    :param date: Effective date (its time zone information is ignored).
+    :param label: Device label, used for ``{DEVICE}``.
+    :param original: Original file name without extension, used for ``{ORIGINAL}``.
+    :return: Sanitized name, without extension.
+    :raises ValueError: If the pattern contains an unknown token.
+    """
+    values = {
+        "YYYY": "{:04d}".format(date.year),
+        "MM": "{:02d}".format(date.month),
+        "DD": "{:02d}".format(date.day),
+        "HH": "{:02d}".format(date.hour),
+        "MIN": "{:02d}".format(date.minute),
+        "SEC": "{:02d}".format(date.second),
+        "DEVICE": label,
+        "ORIGINAL": original,
+    }
+
+    def replace(match: "re.Match[str]") -> str:
+        """
+        Return the value of one pattern token.
+
+        :param match: Token match.
+        :return: Token value.
+        :raises ValueError: If the token is unknown.
+        """
+        token = match.group(1)
+        if token not in values:
+            raise ValueError("unknown token '{{{}}}' in filename_pattern".format(token))
+        return values[token]
+
+    return sanitize_stem(TOKEN_RE.sub(replace, pattern))
+
+
+def build_target_stem(analysis: FileAnalysis, pattern: str) -> str:
+    """
+    Build the target name (without extension and collision suffix) of a ready file.
+
+    :param analysis: Analysis of a ready file, with its device.
+    :param pattern: Validated ``filename_pattern``.
+    :return: Sanitized name, without extension.
+    :raises ValueError: If the file has no date or device, or the pattern has an unknown token.
+    """
+    date = analysis.effective.value if analysis.effective is not None else analysis.date
+    if date is None or analysis.device is None:
+        raise ValueError("{}: no date or device to build a name".format(analysis.relative.as_posix()))
+    return render_stem(pattern, date, analysis.device["label"], analysis.relative.stem)
+
+
+def folder_key(relative: Path) -> str:
+    """
+    Build a case-insensitive key for the folder of a relative path.
+
+    :param relative: File path relative to the source folder.
+    :return: Case-folded POSIX path of the parent folder.
+    """
+    return relative.parent.as_posix().casefold()
+
+
+def main_video_stems(auxiliary_stem: str) -> List[str]:
+    """
+    List the base names a GoPro auxiliary file may share with its main video.
+
+    The same base name comes first; a HERO6+ low-resolution video ``GL<n>``
+    also follows ``GH<n>`` then ``GX<n>``.
+
+    :param auxiliary_stem: Name of the auxiliary file, without extension.
+    :return: Case-folded candidate base names, by priority.
+    """
+    stem = auxiliary_stem.casefold()
+    candidates = [stem]
+    if stem.startswith(GOPRO_LRV_PREFIX):
+        candidates.extend(prefix + stem[len(GOPRO_LRV_PREFIX):] for prefix in GOPRO_VIDEO_PREFIXES)
+    return candidates
+
+
+def group_auxiliaries(
+    analyses: Sequence[FileAnalysis],
+) -> Tuple[Dict[Path, List[FileAnalysis]], Dict[Path, str]]:
+    """
+    Link GoPro auxiliary files (``.LRV``, ``.THM``) to their main video.
+
+    The main video must be in the same folder, have a ``MAIN_VIDEO_EXTENSIONS``
+    extension, share the base name (see ``main_video_stems``) and be ready to
+    rename. A main video takes at most one auxiliary file per extension.
+
+    :param analyses: File analyses, in plan order.
+    :return: Tuple ``(auxiliaries, orphans)``: auxiliary analyses keyed by the
+        relative path of their main video, and the warning of each auxiliary
+        file left alone, keyed by its relative path.
+    """
+    mains = {}  # type: Dict[Tuple[str, str], FileAnalysis]
+    for analysis in analyses:
+        if analysis.status != STATUS_AUXILIARY and analysis.relative.suffix.lower() in MAIN_VIDEO_EXTENSIONS:
+            mains.setdefault((folder_key(analysis.relative), analysis.relative.stem.casefold()), analysis)
+    auxiliaries = {}  # type: Dict[Path, List[FileAnalysis]]
+    orphans = {}  # type: Dict[Path, str]
+    for analysis in analyses:
+        if analysis.status != STATUS_AUXILIARY:
+            continue
+        relative = analysis.relative
+        main = None
+        for stem in main_video_stems(relative.stem):
+            main = mains.get((folder_key(relative), stem))
+            if main is not None:
+                break
+        if main is None:
+            orphans[relative] = "no main video with the same base name in its folder; not renamed"
+            continue
+        if main.status != STATUS_READY:
+            orphans[relative] = "main video {} is skipped; not renamed".format(main.relative.name)
+            continue
+        group = auxiliaries.setdefault(main.relative, [])
+        used = {main.relative.suffix.casefold()} | {member.relative.suffix.casefold() for member in group}
+        if relative.suffix.casefold() in used:
+            orphans[relative] = "another {} file already follows {}; not renamed".format(
+                relative.suffix, main.relative.name)
+            continue
+        group.append(analysis)
+    return auxiliaries, orphans
+
+
+def list_existing_names(folder: Path) -> Set[str]:
+    """
+    List the case-folded names present in a folder (read only).
+
+    :param folder: Folder to list.
+    :return: Case-folded entry names; empty when the folder does not exist.
+    """
+    try:
+        return {name.casefold() for name in os.listdir(str(folder))}
+    except OSError:
+        return set()
+
+
+def resolve_collision(
+    base_stem: str,
+    extensions: Sequence[str],
+    taken: Set[str],
+    existing: Set[str],
+    own_names: Set[str],
+) -> str:
+    """
+    Choose a free name for a group of files sharing one base name.
+
+    ``base_stem`` is tried first, then ``base_stem_01``, ``base_stem_02``...
+    until every ``stem + extension`` of the group is free. Names are compared
+    case-insensitively, so the result is valid on case-insensitive file systems.
+
+    :param base_stem: Rendered name, without extension.
+    :param extensions: Extensions of the group members, pairwise distinct (case-insensitively).
+    :param taken: Case-folded names already planned in the target folder.
+    :param existing: Case-folded names already present in the target folder.
+    :param own_names: Case-folded current names of the group members, which they may keep.
+    :return: Chosen name, without extension.
+    """
+    counter = 0
+    while True:
+        stem = base_stem if counter == 0 else base_stem + COLLISION_SUFFIX_FORMAT.format(counter)
+        names = [(stem + extension).casefold() for extension in extensions]
+        if all(name not in taken and (name not in existing or name in own_names) for name in names):
+            return stem
+        counter += 1
+
+
+def build_plan(
+    analyses: Sequence[FileAnalysis],
+    pattern: str,
+    source_root: Path,
+    dest_root: Optional[Path] = None,
+) -> Tuple[PlanEntry, ...]:
+    """
+    Build the rename plan, shared by preview and apply.
+
+    Files are processed in a fixed order, so the same input always yields the
+    same plan. Each file keeps its relative folder, under the source folder (in
+    place) or under ``dest_root`` (copy). Collisions are resolved per target
+    folder against the planned names and the files already present there;
+    existing files are never targeted, except a file keeping its own name in
+    place. GoPro auxiliary files take the final name of their main video with
+    their own extension. Files are only listed, never modified.
+
+    :param analyses: File analyses, with every device resolved and effective dates computed.
+    :param pattern: Validated ``filename_pattern``.
+    :param source_root: Source folder.
+    :param dest_root: Destination folder of ``--dest``; ``None`` to rename in place.
+    :return: One entry per analysis, sorted by relative source path (case-insensitively).
+    """
+    target_root = source_root if dest_root is None else dest_root
+    ordered = sorted(analyses, key=lambda item: (item.relative.as_posix().casefold(), item.relative.as_posix()))
+    auxiliaries, orphans = group_auxiliaries(ordered)
+    taken = {}  # type: Dict[str, Set[str]]
+    existing = {}  # type: Dict[str, Set[str]]
+    entries = {}  # type: Dict[str, PlanEntry]
+    for analysis in ordered:
+        relative = analysis.relative
+        if analysis.status == STATUS_AUXILIARY:
+            if relative in orphans:
+                warning = orphans[relative]
+                entries[relative.as_posix()] = PlanEntry(relative, None, ACTION_SKIP, warning, (warning,))
+            continue
+        if analysis.status != STATUS_READY:
+            entries[relative.as_posix()] = PlanEntry(relative, None, ACTION_SKIP, analysis.message or analysis.status, ())
+            continue
+        try:
+            base_stem = build_target_stem(analysis, pattern)
+        except ValueError as error:
+            entries[relative.as_posix()] = PlanEntry(relative, None, ACTION_SKIP, str(error), ())
+            continue
+        group = [analysis] + auxiliaries.get(relative, [])
+        key = folder_key(relative)
+        if key not in existing:
+            existing[key] = list_existing_names(target_root / relative.parent)
+        own_names = set() if dest_root is not None else {member.relative.name.casefold() for member in group}
+        folder_taken = taken.setdefault(key, set())
+        stem = resolve_collision(base_stem, [member.relative.suffix for member in group], folder_taken,
+                                 existing[key], own_names)
+        warnings = analysis.effective.warnings if analysis.effective is not None else ()
+        for member in group:
+            target = relative.parent / (stem + member.relative.suffix)
+            folder_taken.add(target.name.casefold())
+            if dest_root is not None:
+                action = ACTION_COPY
+            else:
+                # Compare strings: Windows paths compare equal regardless of case.
+                same = target.as_posix() == member.relative.as_posix()
+                action = ACTION_UNCHANGED if same else ACTION_RENAME
+            message = "" if member is analysis else "follows {}".format(relative.name)
+            entries[member.relative.as_posix()] = PlanEntry(member.relative, target, action, message, warnings)
+    return tuple(entries[analysis.relative.as_posix()] for analysis in ordered)
+
+
+def print_plan(entries: Sequence[PlanEntry], out: TextIO) -> None:
+    """
+    Print the rename plan, one line per file, with its warnings.
+
+    :param entries: Plan entries.
+    :param out: Output stream.
+    """
+    labels = {ACTION_RENAME: "[RENAME]", ACTION_COPY: "[COPY]  ", ACTION_UNCHANGED: "[SAME]  ",
+              ACTION_SKIP: "[SKIP]  "}
+    print("Rename plan:", file=out)
+    for entry in entries:
+        line = "{} {}".format(labels.get(entry.action, entry.action), entry.source.as_posix())
+        if entry.target is not None:
+            line += " -> {}".format(entry.target.as_posix())
+        if entry.message:
+            line += "  ({})".format(entry.message)
+        print(line, file=out)
+        for warning in entry.warnings:
+            if warning != entry.message:
+                print("         warning: {}".format(warning), file=out)
+
+
 def run_check(
     project_root: Path,
     timezone: Optional[str] = None,
@@ -1777,8 +2084,10 @@ def main(
         print("[ERROR] {}".format(error), file=sys.stderr)
         return 1
     print_analysis(analyses, sys.stdout)
+    dest_root = Path(args.dest) if args.dest else None
+    print_plan(build_plan(analyses, config["filename_pattern"], source, dest_root), sys.stdout)
     if args.apply:
-        print("[ERROR] Renaming and copying are not implemented yet (see docs/BACKLOG.md, Epic 4+).",
+        print("[ERROR] Renaming and copying are not implemented yet (see docs/BACKLOG.md, Epic 5).",
               file=sys.stderr)
         return 1
     return 0
