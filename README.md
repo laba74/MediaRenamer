@@ -94,7 +94,7 @@ The configuration lives in `conf/`:
 | `devices.default.json` | yes | Template of `devices.json` (empty list); never modified by the program. |
 | `config.json` | **no** | Your settings. Created from the template on the first run if missing. |
 | `devices.json` | **no** | Your cameras. Created from the template on the first run; rewritten each time a new device is registered. |
-| `devices.json.bak` | **no** | Copy of `devices.json` taken before each rewrite. |
+| `devices.json.bak` | **no** | Copy of `devices.json` taken before the first rewrite of a run. |
 
 An existing personal file is never overwritten by a template. `devices.json` is rewritten atomically (temporary file, then replace), after a `devices.json.bak` copy, so an interruption cannot corrupt it. Both files are validated at every start; any error stops the run before a file is touched.
 
@@ -171,7 +171,7 @@ Copy-Item conf\config.json, conf\devices.json -Destination $HOME\Backups\MediaRe
 
 **Restore.** Copy the saved files back into `conf/`, then run `uv run python media_renamer.py --check`.
 
-**Undo the last device change.** `conf/devices.json.bak` holds the previous version of `devices.json`: copy it over `devices.json`.
+**Undo the last device change.** `conf/devices.json.bak` holds `devices.json` as it was before the last run that registered devices (all the devices added by that run are undone): copy it over `devices.json`.
 
 **Reset.** Delete (or move away) `conf/config.json` and/or `conf/devices.json`; the next run recreates them from `conf/config.default.json` and `conf/devices.default.json`. Never edit the `*.default.json` templates for your own settings: they are versioned and shared.
 

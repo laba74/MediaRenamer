@@ -755,6 +755,47 @@ def test_write_devices_file_backs_up_previous_content(tmp_path: Path) -> None:
     assert sorted(entry.name for entry in tmp_path.iterdir()) == ["devices.json", "devices.json.bak"]
 
 
+def test_write_devices_file_without_backup_keeps_previous_backup(tmp_path: Path) -> None:
+    """
+    Check that ``backup=False`` leaves ``devices.json.bak`` as it was.
+
+    :param tmp_path: Pytest temporary folder.
+    """
+    path = write_json(tmp_path / "devices.json", {"devices": []})
+    original = path.read_text(encoding="utf-8")
+    mr.write_devices_file(path, {"devices": [make_device()]})
+    mr.write_devices_file(path, {"devices": [make_device(), make_device(id="other")]}, backup=False)
+    assert (tmp_path / "devices.json.bak").read_text(encoding="utf-8") == original
+    assert [device["id"] for device in mr.load_devices(path)] == ["gopro9", "other"]
+
+
+def test_validate_devices_scans_time_zones_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that the time zone database is scanned once per validation, and only when needed.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    calls = []
+
+    def fake_zones() -> Set[str]:
+        """
+        Count the scans of the time zone database.
+
+        :return: A small set of zones.
+        """
+        calls.append(1)
+        return {"Europe/Paris", "Asia/Tokyo"}
+
+    monkeypatch.setattr(mr, "get_available_timezones", fake_zones)
+    devices = [make_device(id="d{}".format(index), timezone="Europe/Paris") for index in range(20)]
+    assert mr.validate_devices({"devices": devices}) == []
+    assert len(calls) == 1
+    assert mr.validate_devices({"devices": [make_device()]}) == []
+    assert len(calls) == 1
+    errors = mr.validate_devices({"devices": [make_device(timezone="Mars/Olympus")]})
+    assert "unknown time zone" in errors[0] and len(calls) == 2
+
+
 def test_write_devices_file_rejects_invalid_data(tmp_path: Path) -> None:
     """
     Check that invalid data is refused and the file is left untouched.
@@ -1677,6 +1718,53 @@ def test_compute_effective_date_unavailable_zone(monkeypatch: pytest.MonkeyPatch
     assert "local time kept" in effective.warnings[0]
 
 
+def test_compute_effective_date_ignores_zones_when_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that, in degraded mode, zones are not tried and no warning is added per file.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    simulate_missing_timezone_database(monkeypatch)
+    device = make_device(timezone="Europe/Paris")
+    effective = mr.compute_effective_date(datetime(2024, 1, 2, 3, 4, 5), device, "Europe/Paris", use_zones=False)
+    assert effective == mr.EffectiveDate(datetime(2024, 1, 2, 2, 4, 5), "", "", ())
+    aware = datetime(2024, 1, 2, 12, 0, 0, tzinfo=timezone(timedelta(hours=9)))
+    effective = mr.compute_effective_date(aware, device, use_zones=False)
+    assert effective.value == datetime(2024, 1, 2, 2, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "date, device_zone",
+    [
+        (datetime(1, 1, 1, 0, 30, 0, tzinfo=timezone(timedelta(hours=2))), None),
+        (datetime(1, 1, 1, 1, 30, 0), "Asia/Tokyo"),
+        (datetime(9999, 12, 31, 23, 30, 0), "America/New_York"),
+    ],
+)
+def test_compute_effective_date_out_of_range_conversion(paris: Any, date: datetime, device_zone: Any) -> None:
+    """
+    Check that a conversion to UTC leaving years 1 to 9999 raises ``ValueError``, not ``OverflowError``.
+
+    :param paris: The ``Europe/Paris`` time zone (ensures a time zone database is available).
+    :param date: Date read from the file.
+    :param device_zone: Time zone of the device, if any.
+    """
+    device = make_device(offset="+00:00:00", **({"timezone": device_zone} if device_zone else {}))
+    with pytest.raises(ValueError, match="out of range once converted to UTC"):
+        mr.compute_effective_date(date, device)
+
+
+def test_add_effective_dates_skips_out_of_range_conversion() -> None:
+    """
+    Check that a date out of range once converted to UTC skips that file only.
+    """
+    early = datetime(1, 1, 1, 0, 30, 0, tzinfo=timezone(timedelta(hours=2)))
+    analyses = [ready("a.jpg")._replace(date=early, effective=None), ready("b.jpg")._replace(effective=None)]
+    result = mr.add_effective_dates(analyses)
+    assert result[0].status == mr.STATUS_SKIPPED and "out of range" in result[0].message
+    assert result[1].status == mr.STATUS_READY and result[1].effective is not None
+
+
 def test_format_effective_date() -> None:
     """
     Check the display of UTC and local effective dates.
@@ -2064,7 +2152,8 @@ def test_resolve_unknown_devices_asks_once_per_device(tmp_path: Path) -> None:
     assert [analysis.device["id"] for analysis in result] == ["hero9-black"] * 3 + ["e4500"]
     assert sum("Label" in prompt for prompt in prompts) == 2
     assert [device["id"] for device in mr.load_devices(path)] == ["other", "hero9-black", "e4500"]
-    assert (tmp_path / "devices.json.bak").is_file()
+    # The backup keeps the file as it was before the run, not after the first new device.
+    assert [device["id"] for device in mr.load_devices(tmp_path / "devices.json.bak")] == ["other"]
     assert devices == mr.load_devices(path)
     assert "Saved device 'hero9-black' (label 'HERO9 Black'; Model 'HERO9 Black') to" in out.getvalue()
     assert "  1 file(s), taken 2024-01-02, e.g. v.mp4\n" in out.getvalue()
@@ -2105,6 +2194,42 @@ def test_analyze_source_reads_without_modifying(
     assert all(path.is_absolute() for path in seen)
     assert all(analysis.status == mr.STATUS_READY for analysis in analyses)
     assert snapshot(media_tree) == before
+
+
+def test_analyze_source_does_not_read_auxiliary_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that GoPro auxiliary files are not sent to ExifTool, and that a folder of them only skips ExifTool.
+
+    :param tmp_path: Pytest temporary folder.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    for name in ("GH010001.MP4", "GL010001.LRV", "GH010001.THM", "GH010001.WAV", "voice.wav"):
+        (source / name).write_bytes(b"")
+    seen = []
+
+    def fake_read_metadata(executable: Path, paths: Any) -> Any:
+        """
+        Record the files sent to ExifTool and return dated GoPro tags.
+
+        :param executable: Ignored.
+        :param paths: Files to describe.
+        :return: Tuple ``(metadata, errors)``.
+        """
+        seen.extend(path.name for path in paths)
+        return {path: dict(DATED_TAGS) for path in paths}, {}
+
+    monkeypatch.setattr(mr, "read_metadata", fake_read_metadata)
+    extensions = [".mp4", ".lrv", ".thm", ".wav"]
+    analyses = mr.analyze_source(source, extensions, [make_device()], tmp_path / "devices.json", Path("exiftool"))
+    assert sorted(seen) == ["GH010001.MP4", "voice.wav"]
+    assert sorted(analysis.status for analysis in analyses) == [mr.STATUS_AUXILIARY] * 3 + [mr.STATUS_READY] * 2
+    for name in ("GH010001.MP4", "voice.wav"):
+        (source / name).unlink()
+    monkeypatch.setattr(mr, "read_metadata", None)
+    analyses = mr.analyze_source(source, extensions, [], tmp_path / "devices.json", Path("exiftool"))
+    assert [analysis.status for analysis in analyses] == [mr.STATUS_AUXILIARY] * 3
 
 
 def test_analyze_source_empty_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2293,10 +2418,36 @@ def test_build_target_stem() -> None:
 
 def test_folder_key() -> None:
     """
-    Check that folder keys ignore case and the file name.
+    Check that folder keys ignore the file name but keep the folder case.
     """
-    assert mr.folder_key(Path("Sub/A.jpg")) == mr.folder_key(Path("sub/b.JPG")) == "sub"
+    assert mr.folder_key(Path("Sub/A.jpg")) == mr.folder_key(Path("Sub/b.JPG")) == "Sub"
+    assert mr.folder_key(Path("sub/a.jpg")) == "sub"
     assert mr.folder_key(Path("a.jpg")) == "."
+
+
+def test_group_auxiliaries_keeps_folders_differing_by_case_apart() -> None:
+    """
+    Check that ``A`` and ``a`` are two folders: no pairing across them (case-sensitive file systems).
+    """
+    groups, orphans = mr.group_auxiliaries([ready("A/GH010123.MP4"), auxiliary("a/GL010123.LRV")])
+    assert groups == {}
+    assert "no main video" in orphans[Path("a/GL010123.LRV")]
+
+
+def test_build_plan_lists_existing_names_per_folder_case(tmp_path: Path) -> None:
+    """
+    Check that existing names are looked up in each folder, ``A`` and ``a`` included.
+
+    On a case-insensitive file system both paths are one folder; the test then
+    only checks that both are looked up.
+
+    :param tmp_path: Pytest temporary folder.
+    """
+    (tmp_path / "A").mkdir()
+    (tmp_path / "a").mkdir(exist_ok=True)
+    (tmp_path / "a" / (BASE + ".jpg")).write_bytes(b"")
+    plan = mr.build_plan([ready("A/x.jpg", when=datetime(2020, 1, 1)), ready("a/y.jpg")], PATTERN, tmp_path)
+    assert targets(plan)["a/y.jpg"] == "a/" + BASE + "_01.jpg"
 
 
 def test_gopro_file_id() -> None:
@@ -2490,7 +2641,9 @@ def test_build_plan_auxiliary_files_follow_main_video(tmp_path: Path) -> None:
                              "GH010001.THM": BASE + "_01.THM", "GOPR0009.THM": None}
     by_source = {entry.source.name: entry for entry in plan}
     assert by_source["GL010001.LRV"].message == "follows GH010001.MP4"
-    assert by_source["GL010001.LRV"].warnings == ("dst",)
+    assert by_source["GH010001.MP4"].warnings == ("dst",)
+    assert by_source["GL010001.LRV"].warnings == () and by_source["GH010001.THM"].warnings == ()
+    assert mr.summarize_run(plan).counts["warnings"] == 2  # the main video's and the orphan's
     orphan = by_source["GOPR0009.THM"]
     assert orphan.action == mr.ACTION_SKIP and "no main video" in orphan.warnings[0]
 
@@ -2634,6 +2787,84 @@ def test_safe_rename_case_only(tmp_path: Path) -> None:
     assert os.listdir(str(tmp_path)) == ["a.jpg"]
 
 
+def test_are_separate_names(tmp_path: Path) -> None:
+    """
+    Check the distinction between two names of one file and two spellings of one name.
+
+    :param tmp_path: Pytest temporary folder.
+    """
+    source = tmp_path / "a.jpg"
+    source.write_bytes(b"a")
+    os.link(str(source), str(tmp_path / "b.jpg"))
+    assert mr.are_separate_names(source, tmp_path / "b.jpg")
+    assert not mr.are_separate_names(source, source)
+    # Same name in another folder: always another entry.
+    assert mr.are_separate_names(source, tmp_path / "sub" / "a.jpg")
+    # A case-only variant is one entry, unless both spellings are listed (case-sensitive file system).
+    assert not mr.are_separate_names(source, tmp_path / "A.JPG")
+    assert not mr.are_separate_names(tmp_path / "missing" / "a.jpg", tmp_path / "missing" / "A.jpg")
+
+
+def test_are_separate_names_case_variants(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that two listed spellings of one name are two entries (hard links on a case-sensitive file system).
+
+    :param tmp_path: Pytest temporary folder.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(mr.os, "listdir", lambda folder: ["a.jpg", "A.JPG"])
+    assert mr.are_separate_names(tmp_path / "a.jpg", tmp_path / "A.JPG")
+
+
+def test_deferred_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that SIGINT and SIGTERM are blocked inside the section and the mask restored after.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    calls = []
+
+    def fake_sigmask(how: int, mask: Any) -> Set[int]:
+        """
+        Record the signal mask changes.
+
+        :param how: Mask operation.
+        :param mask: Signals concerned.
+        :return: The previous mask.
+        """
+        calls.append((how, set(mask)))
+        return {99}
+
+    monkeypatch.setattr(mr.signal, "pthread_sigmask", fake_sigmask, raising=False)
+    monkeypatch.setattr(mr.signal, "SIG_BLOCK", 0, raising=False)
+    monkeypatch.setattr(mr.signal, "SIG_SETMASK", 2, raising=False)
+    monkeypatch.setattr(mr.signal, "SIGTERM", 15, raising=False)
+    with pytest.raises(RuntimeError):
+        with mr.deferred_signals():
+            assert calls == [(0, {mr.signal.SIGINT, 15})]
+            raise RuntimeError("interrupted section")
+    assert calls[-1] == (2, {99})
+    monkeypatch.delattr(mr.signal, "pthread_sigmask")
+    with mr.deferred_signals():
+        pass
+    assert len(calls) == 2
+
+
+def test_safe_rename_onto_other_name_of_same_file(tmp_path: Path) -> None:
+    """
+    Check that a target which is a hard link to the source ends with a single name, the target.
+
+    This is what a run interrupted between the link and the removal leaves behind.
+
+    :param tmp_path: Pytest temporary folder.
+    """
+    source = tmp_path / "a.jpg"
+    source.write_bytes(b"a")
+    os.link(str(source), str(tmp_path / "b.jpg"))
+    mr.safe_rename(source, tmp_path / "b.jpg", True)
+    assert os.listdir(str(tmp_path)) == ["b.jpg"] and (tmp_path / "b.jpg").read_bytes() == b"a"
+
+
 def test_safe_rename_without_hard_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Check the fallback for file systems without hard links (e.g. exFAT memory cards).
@@ -2674,6 +2905,30 @@ def test_safe_copy(tmp_path: Path) -> None:
     with pytest.raises(FileExistsError):
         mr.safe_copy(source, target)
     assert target.read_bytes() == b"a"
+
+
+def test_safe_copy_when_permissions_are_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that a file system refusing permissions (FAT, exFAT) does not make a complete copy fail.
+
+    :param tmp_path: Pytest temporary folder.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    def refused_copystat(source: str, target: str) -> None:
+        """
+        Fail like ``chmod`` on a FAT drive mounted on Linux.
+
+        :param source: Ignored.
+        :param target: Ignored.
+        :raises PermissionError: Always.
+        """
+        raise PermissionError(errno.EPERM, "operation not permitted")
+
+    monkeypatch.setattr(mr.shutil, "copystat", refused_copystat)
+    source = tmp_path / "a.jpg"
+    source.write_bytes(b"a")
+    mr.safe_copy(source, tmp_path / "dest" / "b.jpg")
+    assert (tmp_path / "dest" / "b.jpg").read_bytes() == b"a"
 
 
 def test_safe_copy_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3312,6 +3567,26 @@ def test_main_analysis_prompts_once_and_saves(analyzed_project: Path, capsys: py
     assert [device["id"] for device in devices] == ["gopro9"]
 
 
+def test_main_analysis_new_device_tz_without_database(
+    analyzed_project: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Check that a time zone given to a device registered during the run is announced as ignored once.
+
+    :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
+    :param capsys: Pytest fixture capturing the standard output and error streams.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    simulate_missing_timezone_database(monkeypatch)
+    answers = iter(["GoPro9", "-01:00:00", "Europe/Paris"])
+    code = mr.main(["--source", str(analyzed_project / "src")], project_root=analyzed_project,
+                   interactive=True, input_func=lambda prompt: next(answers))
+    assert code == 0
+    captured = capsys.readouterr()
+    assert captured.err.count("[WARNING] Device time zones ignored") == 1
+    assert "2 ready" in captured.out and "0 warning(s)" in captured.out
+
+
 def test_main_analysis_prints_copy_plan(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:
     """
     Check that ``--dest`` plans copies without creating the destination or touching the sources.
@@ -3573,6 +3848,8 @@ def test_main_analysis_tz_without_database(
     captured = capsys.readouterr()
     assert "[WARNING] --tz: time zone 'Europe/Paris' ignored" in captured.err
     assert "local" in captured.out and "2 ready" in captured.out
+    # Warned once for the run, not once per file.
+    assert "0 warning(s)" in captured.out and "not found" not in captured.out
 
 
 def test_main_analysis_device_tz_without_database(
@@ -3593,6 +3870,7 @@ def test_main_analysis_device_tz_without_database(
     captured = capsys.readouterr()
     assert captured.err.count("[WARNING] Device time zones ignored") == 1
     assert "2 ready" in captured.out
+    assert "0 warning(s)" in captured.out and "not found" not in captured.out
 
 
 def test_main_analysis_missing_exiftool(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:

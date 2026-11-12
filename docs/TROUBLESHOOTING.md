@@ -59,7 +59,7 @@ Devices are stored in `conf/devices.json` (see the README for the format). Back 
 | Problem | Fix |
 | --- | --- |
 | Wrong label in the names | Change `label`. Already renamed files keep their old names; run again to rename them (the pattern must still match). |
-| A typo was entered when the device was registered | Edit the entry, or restore `conf/devices.json.bak` (the version before the last registration). |
+| A typo was entered when the device was registered | Edit the entry, or restore `conf/devices.json.bak` (the version before the last run that registered devices). |
 | Files go to the wrong device | Entries are tried in file order and the first match wins: move the more specific entry (with `make` and `serial_number`) above the generic one. |
 | Two bodies of the same model need different labels or offsets | Add `serial_number` to each entry's `match`. Files without a serial number (many videos) only match entries whose `model`/`make` match, so keep a generic entry last for them. |
 | A device is asked again at every run | Its `Make`/`Model` in the files differ from `match`: compare them with [Inspect a file's tags](#inspect-a-files-tags). Comparisons ignore case and extra spaces, not other differences. |
