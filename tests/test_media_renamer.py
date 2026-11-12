@@ -396,6 +396,25 @@ def test_get_available_timezones_without_zoneinfo(monkeypatch: pytest.MonkeyPatc
     assert mr.get_available_timezones() == set()
 
 
+def test_has_timezone_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that the database is reported available only when zones are known.
+    """
+    monkeypatch.setattr(mr, "get_available_timezones", lambda: {"Europe/Paris"})
+    assert mr.has_timezone_database() is True
+    monkeypatch.setattr(mr, "get_available_timezones", lambda: set())
+    assert mr.has_timezone_database() is False
+
+
+def test_describe_missing_timezone_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check the explanation given for a missing database, with and without ``zoneinfo``.
+    """
+    assert "tzdata" in mr.describe_missing_timezone_database()
+    monkeypatch.setattr(mr, "zoneinfo", None)
+    assert "Python 3.9" in mr.describe_missing_timezone_database()
+
+
 def test_validate_timezone_syntax_only() -> None:
     """
     Check syntactic validation when no time zone database is available.
@@ -878,6 +897,29 @@ def test_run_check_reports_bad_timezone(checked_project: Path) -> None:
     assert "--tz" in err
 
 
+def test_run_check_reports_timezone_database(checked_project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that ``--check`` reports the time zone database when it is available.
+    """
+    monkeypatch.setattr(mr, "get_available_timezones", lambda: {"Europe/Paris", "UTC"})
+    _, out, _ = run_check_captured(checked_project, environ={"PATH": ""})
+    assert "[OK] Time zone database: 2 zone(s)" in out
+
+
+def test_run_check_degraded_without_timezone_database(
+    checked_project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Check that a missing time zone database only yields warnings, even with ``--tz``.
+    """
+    monkeypatch.setattr(mr, "zoneinfo", None)
+    code, out, err = run_check_captured(checked_project, timezone="Europe/Paris")
+    assert "[WARNING] Time zone database" in out and "degraded mode" in out
+    assert "[WARNING] --tz: time zone 'Europe/Paris' ignored" in out
+    assert "--tz" not in err
+    assert code == 0
+
+
 def test_run_check_reports_missing_exiftool(project: Path) -> None:
     """
     Check that ``--check`` fails explicitly when ExifTool is missing.
@@ -1231,11 +1273,42 @@ def test_check_cli_timezone(paris: Any, monkeypatch: pytest.MonkeyPatch) -> None
     """
     Check syntax errors, unknown zones and a missing time zone database for ``--tz``.
     """
-    assert mr.check_cli_timezone("Europe/Paris") is None
-    assert "invalid time zone" in mr.check_cli_timezone("not a zone")
-    assert "unknown time zone" in mr.check_cli_timezone("Europe/Atlantis")
+    assert mr.check_cli_timezone("Europe/Paris") == (None, None)
+    error, warning = mr.check_cli_timezone("not a zone")
+    assert "invalid time zone" in error and warning is None
+    error, warning = mr.check_cli_timezone("Europe/Atlantis")
+    assert "unknown time zone" in error and warning is None
+
+
+def test_check_cli_timezone_load_error_with_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that a zone that fails to load from an available database is an error.
+    """
+    def failing_load_zone(name: str) -> Any:
+        """
+        Simulate a zone listed in the database but impossible to load.
+
+        :param name: Zone name.
+        :raises ValueError: Always.
+        """
+        raise ValueError("time zone {!r} not found".format(name))
+
+    monkeypatch.setattr(mr, "get_available_timezones", lambda: {"Europe/Paris"})
+    monkeypatch.setattr(mr, "load_zone", failing_load_zone)
+    error, warning = mr.check_cli_timezone("Europe/Paris")
+    assert "not found" in error and warning is None
+
+
+def test_check_cli_timezone_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Check that, without a time zone database, a valid ``--tz`` only yields a warning.
+    """
     monkeypatch.setattr(mr, "zoneinfo", None)
-    assert "Python 3.9" in mr.check_cli_timezone("Europe/Paris")
+    error, warning = mr.check_cli_timezone("Europe/Paris")
+    assert error is None
+    assert "ignored, local times kept" in warning and "Python 3.9" in warning
+    error, warning = mr.check_cli_timezone("not a zone")
+    assert "invalid time zone" in error and warning is None
 
 
 def test_load_zone_without_zoneinfo(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2013,15 +2086,35 @@ def test_main_analysis_applies_offset_and_tz(
     assert "zone Europe/Paris (--tz)" in out
 
 
-def test_main_rename_tz_without_database(
-    checked_project: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+def test_main_analysis_tz_without_database(
+    analyzed_project: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Check that ``--tz`` is rejected when its zone cannot be loaded.
+    Check that, without a time zone database, ``--tz`` is ignored with a warning (degraded mode).
     """
     monkeypatch.setattr(mr, "zoneinfo", None)
-    assert mr.main(["--source", "in", "--tz", "Europe/Paris"], project_root=checked_project) == 1
-    assert "Python 3.9" in capsys.readouterr().err
+    write_json(analyzed_project / "conf" / "devices.json", {"devices": [make_device()]})
+    argv = ["--source", str(analyzed_project / "src"), "--tz", "Europe/Paris"]
+    assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
+    captured = capsys.readouterr()
+    assert "[WARNING] --tz: time zone 'Europe/Paris' ignored" in captured.err
+    assert "local" in captured.out and "2 ready" in captured.out
+
+
+def test_main_analysis_device_tz_without_database(
+    analyzed_project: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Check that device time zones are announced as ignored once when no database is available.
+    """
+    monkeypatch.setattr(mr, "zoneinfo", None)
+    write_json(analyzed_project / "conf" / "devices.json",
+               {"devices": [make_device(timezone="Europe/Paris")]})
+    argv = ["--source", str(analyzed_project / "src")]
+    assert mr.main(argv, project_root=analyzed_project, interactive=False) == 0
+    captured = capsys.readouterr()
+    assert captured.err.count("[WARNING] Device time zones ignored") == 1
+    assert "2 ready" in captured.out
 
 
 def test_main_analysis_missing_exiftool(analyzed_project: Path, capsys: pytest.CaptureFixture) -> None:

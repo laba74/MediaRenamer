@@ -34,7 +34,7 @@ The date used in file names (the *effective date*) is computed in two steps. The
 
 **Daylight saving time.** When a zone is applied, a local time that occurs twice (clocks set back, e.g. 02:30 on 27 October 2024 in `Europe/Paris`) or never (clocks set forward, e.g. 02:30 on 31 March 2024) cannot be converted reliably. Such files keep their local time and a warning is printed: nothing is converted silently.
 
-**Time zone database.** IANA zones need Python 3.9+ and a time zone database. Linux and macOS provide one; on Windows, the `tzdata` package is needed (installed by `uv sync`). Without it, `--tz` is rejected and device zones produce a warning while the local time is kept.
+**Time zone database.** IANA zones need Python 3.9+ and a time zone database. Linux and macOS provide one; on Windows, the `tzdata` package is needed (installed by `uv sync`). Without it, the program runs in **degraded mode**: `--tz` and device zones are ignored with a warning and local times are kept (dates stored with an offset in the metadata are still converted to UTC). `--check` reports whether the database is available; its absence is a warning, not a failure. A syntactically invalid `--tz` is still rejected.
 
 ### Limits of zone-less metadata
 

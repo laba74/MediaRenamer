@@ -393,6 +393,29 @@ def get_available_timezones() -> Set[str]:
         return set()
 
 
+def has_timezone_database() -> bool:
+    """
+    Tell whether a time zone database is available.
+
+    Without one (Windows without the ``tzdata`` package, or Python 3.8), the
+    program runs in degraded mode: zones cannot be applied and local times are kept.
+
+    :return: ``True`` when at least one IANA zone is known.
+    """
+    return bool(get_available_timezones())
+
+
+def describe_missing_timezone_database() -> str:
+    """
+    Explain why no time zone database is available and how to get one.
+
+    :return: Human-readable explanation.
+    """
+    if zoneinfo is None:
+        return "no time zone database available: Python 3.9+ is required"
+    return "no time zone database found (on Windows, install the 'tzdata' package, e.g. with 'uv sync')"
+
+
 def validate_timezone(name: Any, available: Optional[Set[str]] = None) -> Optional[str]:
     """
     Validate an IANA time zone name.
@@ -1013,20 +1036,28 @@ def load_zone(name: str) -> Any:
         )
 
 
-def check_cli_timezone(name: str) -> Optional[str]:
+def check_cli_timezone(name: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Validate the ``--tz`` value: IANA syntax, then loading from the time zone database.
 
+    A syntax error, or a zone missing from an available database, is an error.
+    When no database is available at all, a syntactically valid zone only yields
+    a warning (degraded mode): the zone is ignored and local times are kept.
+
     :param name: Value of ``--tz``.
-    :return: An error message, or ``None`` when the zone can be used.
+    :return: Tuple ``(error, warning)``; both ``None`` when the zone can be used.
     """
     error = validate_timezone(name)
-    if error is None:
-        try:
-            load_zone(name)
-        except ValueError as load_error:
-            error = str(load_error)
-    return error
+    if error is not None:
+        return error, None
+    try:
+        load_zone(name)
+    except ValueError as load_error:
+        if has_timezone_database():
+            return str(load_error), None
+        return None, "time zone {!r} ignored, local times kept: {}".format(
+            name, describe_missing_timezone_database())
+    return None, None
 
 
 def classify_local_time(local: datetime, zone: Any) -> str:
@@ -1653,11 +1684,18 @@ def run_check(
     except ConfigError as error:
         print("[ERROR] Devices: {}".format(error), file=err)
         failed = True
+    if has_timezone_database():
+        print("[OK] Time zone database: {} zone(s)".format(len(get_available_timezones())), file=out)
+    else:
+        print("[WARNING] Time zone database: {}; degraded mode, local times are kept".format(
+            describe_missing_timezone_database()), file=out)
     if timezone is not None:
-        tz_error = check_cli_timezone(timezone)
+        tz_error, tz_warning = check_cli_timezone(timezone)
         if tz_error:
             print("[ERROR] --tz: {}".format(tz_error), file=err)
             failed = True
+        elif tz_warning:
+            print("[WARNING] --tz: {}".format(tz_warning), file=out)
         else:
             print("[OK] Time zone: {}".format(timezone), file=out)
     try:
@@ -1708,10 +1746,15 @@ def main(
         print("[ERROR] {}".format(error), file=sys.stderr)
         return 1
     if args.tz is not None:
-        tz_error = check_cli_timezone(args.tz)
+        tz_error, tz_warning = check_cli_timezone(args.tz)
         if tz_error:
             print("[ERROR] --tz: {}".format(tz_error), file=sys.stderr)
             return 1
+        if tz_warning:
+            print("[WARNING] --tz: {}".format(tz_warning), file=sys.stderr)
+    elif any(device.get("timezone") for device in devices) and not has_timezone_database():
+        print("[WARNING] Device time zones ignored, local times kept: {}".format(
+            describe_missing_timezone_database()), file=sys.stderr)
     forced_device = None
     if args.device is not None:
         forced_device = find_device(devices, args.device)
