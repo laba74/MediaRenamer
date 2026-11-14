@@ -1,6 +1,6 @@
 # MediaRenamer
 
-MediaRenamer is a configurable command-line tool that renames photos and videos using metadata, device-specific labels, and time offsets.
+MediaRenamer is a configurable command-line tool that renames photos and videos using metadata, device-specific names, and time offsets.
 
 ```text
 IMG_20220125_151850_01.jpg  ->  2022-01-25_15-18-42_TelEric.jpg
@@ -9,7 +9,7 @@ GL011892.LRV                ->  2025-07-14_17-19-24_GoPro1.LRV   (follows its ma
 ```
 
 - Reads capture dates and camera make/model through [ExifTool](https://exiftool.org/), run as an external program.
-- Gives each camera a label and a clock correction, stored in `conf/devices.json`; asks for them the first time a new camera is seen.
+- Gives each camera a short name (its `id`, used in file names), an optional description and a clock correction, stored in `conf/devices.json`; asks for them the first time a new camera is seen.
 - Previews by default: nothing is changed until you pass `--apply`.
 - Renames in place, or copies to a destination folder and leaves the sources untouched.
 - Never writes metadata, never overwrites a file, never uses the file system date, never flattens folders, and does not deduplicate content.
@@ -82,7 +82,7 @@ On the first run, the personal configuration files are created from their templa
 uv run python media_renamer.py --source "path/to/photos"
 ```
 
-This only prints what would be done. When a camera is not yet in `conf/devices.json`, the program asks for its label and clock offset first (see [Unknown devices](#unknown-devices)). Run the same command with `--apply` once the plan looks right.
+This only prints what would be done. When a camera is not yet in `conf/devices.json`, the program asks for its id, an optional label and its clock offset first (see [Unknown devices](#unknown-devices)). Run the same command with `--apply` once the plan looks right.
 
 ## Configuration
 
@@ -115,10 +115,10 @@ An existing personal file is never overwritten by a template. `devices.json` is 
   | --- | --- |
   | `{YYYY}` `{MM}` `{DD}` | Year (4 digits), month, day of the effective date |
   | `{HH}` `{MIN}` `{SEC}` | Hour (24 h), minute, second of the effective date |
-  | `{DEVICE}` | The device `label` |
+  | `{DEVICE}` | The device `id` |
   | `{ORIGINAL}` | The original file name, without extension |
 
-  Unknown tokens, path separators, characters invalid in file names (`< > : " / \ | ? *`), a leading `.` and a trailing `.` or space are rejected at startup. Device labels must be portable too: no character forbidden on Windows, macOS, Linux or Android memory cards (`< > : " / \ | ? *`, control characters, DEL), and no leading or trailing space or dot. In the rendered name, invalid characters coming from `{ORIGINAL}` are replaced by `_`, the name is normalized to Unicode NFC, and it is cut to 200 UTF-8 bytes (whole characters only) so that, with the collision suffix and the extension, it stays within the 255-byte file name limit of common file systems.
+  Unknown tokens, path separators, characters invalid in file names (`< > : " / \ | ? *`), a leading `.` and a trailing `.` or space are rejected at startup. Device ids must be portable too: no character forbidden on Windows, macOS, Linux or Android memory cards (`< > : " / \ | ? *`, control characters, DEL), and no leading or trailing space or dot. In the rendered name, invalid characters coming from `{ORIGINAL}` are replaced by `_`, the name is normalized to Unicode NFC, and it is cut to 200 UTF-8 bytes (whole characters only) so that, with the collision suffix and the extension, it stays within the 255-byte file name limit of common file systems.
 - `supported_extensions` — extensions to process, each starting with a dot; compared case-insensitively. Other files are ignored.
 - `dry_run_by_default` — `true` (recommended): preview unless `--apply` is given. `false`: apply unless `--dry-run` is given.
 - `log_level` — `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, for `.logs/rename.log`.
@@ -129,14 +129,14 @@ An existing personal file is never overwritten by a template. `devices.json` is 
 {
   "devices": [
     {
-      "id": "gopro1",
-      "label": "GoPro1",
+      "id": "GoPro1",
+      "label": "My first GoPro",
       "match": { "model": "HERO9 Black" },
       "offset": "+00:00:00"
     },
     {
-      "id": "alpha",
-      "label": "A7III",
+      "id": "A7III",
+      "label": "Sony Alpha 7 III",
       "match": { "make": "SONY", "model": "ILCE-7M3", "serial_number": "" },
       "offset": "-00:02:30",
       "timezone": "Europe/Paris"
@@ -145,13 +145,13 @@ An existing personal file is never overwritten by a template. `devices.json` is 
 }
 ```
 
-- `id` — unique identifier, used by `--device`.
-- `label` — text inserted by `{DEVICE}`.
+- `id` — unique short name (case-insensitive), inserted in file names by `{DEVICE}` and used by `--device`. It must be valid in file names (see above).
+- `label` — optional free description for you (e.g. `"Old family phone"`); never used in file names, only shown in messages. May be empty or omitted.
 - `match` — any of `make`, `model`, `serial_number`, as reported by ExifTool (`Make`, `Model`, `SerialNumber`). See [Device matching](#device-matching).
 - `offset` — signed `HH:MM:SS` added to the file's date to correct the camera clock (`+00:00:00` when the clock is right). See [Effective date](#effective-date-clock-offset-and-time-zone).
 - `timezone` — optional IANA zone (e.g. `Europe/Paris`, `UTC`) of the camera clock.
 
-You normally do not edit this file by hand: new cameras are added interactively. Editing it is useful to rename a label, fix an offset or reorder entries; run `--check` afterwards.
+You normally do not edit this file by hand: new cameras are added interactively. Editing it is useful to rename an id or a label, fix an offset or reorder entries; run `--check` afterwards.
 
 ## Back up your personal files
 
@@ -300,7 +300,7 @@ Each file is matched against `conf/devices.json`, in file order; the first match
 
 ### Unknown devices
 
-When files come from a device missing in `conf/devices.json`, the tool shows its make and model, how many files it took, their capture date range, a few file names and, when present, the software or firmware that wrote them. It then asks, once per device and before touching any file, for a label, a clock offset (signed `HH:MM:SS`), an optional IANA time zone and, when the file has one, whether to match this camera body by its serial number. The answer is saved to `conf/devices.json` (with a `devices.json.bak` copy) and reused for every matching file.
+When files come from a device missing in `conf/devices.json`, the tool shows its make and model, how many files it took, their capture date range, a few file names and, when present, the software or firmware that wrote them. It then asks, once per device and before touching any file, for an id (used in file names; it must not already exist), an optional label, a clock offset (signed `HH:MM:SS`), an optional IANA time zone and, when the file has one, whether to match this camera body by its serial number. The answer is saved to `conf/devices.json` (with a `devices.json.bak` copy) and reused for every matching file.
 
 Without an interactive terminal, the run stops with the list of unknown devices: add them to `conf/devices.json`, run in a terminal, or use `--device`. Files with neither make nor model are skipped unless `--device` is given.
 

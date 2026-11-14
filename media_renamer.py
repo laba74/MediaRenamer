@@ -2,6 +2,7 @@
 
 import argparse
 import errno
+import functools
 import json
 import logging
 import os
@@ -51,8 +52,8 @@ CONFIG_KEYS = ("filename_pattern", "supported_extensions", "dry_run_by_default",
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 EXTENSION_RE = re.compile(r"^\.[A-Za-z0-9]+$")
 
-DEVICE_REQUIRED_KEYS = ("id", "label", "match", "offset")
-DEVICE_OPTIONAL_KEYS = ("timezone",)
+DEVICE_REQUIRED_KEYS = ("id", "match", "offset")
+DEVICE_OPTIONAL_KEYS = ("label", "timezone")
 MATCH_KEYS = ("make", "model", "serial_number")
 OFFSET_RE = re.compile(r"^([+-])?(\d{2,}):([0-5]\d):([0-5]\d)$")
 TIMEZONE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+)*$")
@@ -525,33 +526,43 @@ def validate_timezone(name: Any, available: Optional[Set[str]] = None) -> Option
     return None
 
 
-def validate_label(label: Any) -> List[str]:
+def validate_device_id(device_id: Any) -> List[str]:
     """
-    Validate a device label, inserted in file names by ``{DEVICE}``.
+    Validate a device id, inserted in file names by ``{DEVICE}``.
 
-    The label must be valid in file names on every common system (Windows,
+    The id must be valid in file names on every common system (Windows,
     macOS, Linux, Android): no forbidden character (see
     ``find_invalid_filename_chars``), and no leading or trailing space or dot,
     which some systems strip or refuse.
 
-    :param label: Label to check.
-    :return: Error messages; empty when the label is valid.
+    :param device_id: Id to check.
+    :return: Error messages; empty when the id is valid.
     """
-    if not isinstance(label, str) or not label.strip():
-        return ["'label' must be a non-empty string"]
+    if not isinstance(device_id, str) or not device_id.strip():
+        return ["'id' must be a non-empty string"]
     errors = []
-    invalid = find_invalid_filename_chars(label)
+    invalid = find_invalid_filename_chars(device_id)
     if invalid:
         errors.append(
-            "'label' contains invalid file name characters: {}".format(
+            "'id' contains invalid file name characters: {}".format(
                 " ".join(repr(char) for char in invalid)
             )
         )
-    if label != label.strip():
-        errors.append("'label' must not start or end with a space")
-    if label.startswith(".") or label.endswith("."):
-        errors.append("'label' must not start or end with '.'")
+    if device_id != device_id.strip():
+        errors.append("'id' must not start or end with a space")
+    if device_id.startswith(".") or device_id.endswith("."):
+        errors.append("'id' must not start or end with '.'")
     return errors
+
+
+def validate_label(label: Any) -> List[str]:
+    """
+    Validate a device label: an optional free description for the user, never used in file names.
+
+    :param label: Label to check.
+    :return: Error messages; empty when the label is a string, even an empty one.
+    """
+    return [] if isinstance(label, str) else ["'label' must be a string"]
 
 
 def validate_match(match: Any) -> List[str]:
@@ -591,8 +602,8 @@ def validate_device(device: Any, available_timezones: Optional[Set[str]] = None)
     for key in DEVICE_REQUIRED_KEYS:
         if key not in device:
             errors.append("missing field '{}'".format(key))
-    if "id" in device and (not isinstance(device["id"], str) or not device["id"].strip()):
-        errors.append("'id' must be a non-empty string")
+    if "id" in device:
+        errors.extend(validate_device_id(device["id"]))
     if "label" in device:
         errors.extend(validate_label(device["label"]))
     if "match" in device:
@@ -1487,11 +1498,12 @@ def describe_device(device: Mapping[str, Any]) -> str:
     """
     Describe a device entry for the user: its id, completed by readable details.
 
-    The id stays the reference used in ``conf/devices.json`` and by ``--device``;
-    the label and the ``match`` criteria (make, model) tell which camera it is.
+    The id is the name used in file names, in ``conf/devices.json`` and by
+    ``--device``; the label (when set) and the ``match`` criteria (make, model)
+    tell which camera it is.
 
     :param device: Device entry.
-    :return: Text such as ``'hero9-black' (label 'HERO9 Black'; Make 'GoPro', Model 'HERO9 Black')``.
+    :return: Text such as ``'GoPro9' (label 'My GoPro'; Make 'GoPro', Model 'HERO9 Black')``.
     """
     match = device.get("match") or {}
     identity = DeviceIdentity(
@@ -1499,10 +1511,12 @@ def describe_device(device: Mapping[str, Any]) -> str:
         clean_text(match.get("model")),
         clean_text(match.get("serial_number")),
     )
-    details = ["label '{}'".format(clean_text(device.get("label")))]
+    label = clean_text(device.get("label"))
+    details = ["label '{}'".format(label)] if label else []
     if any(identity):
         details.append(describe_identity(identity))
-    return "'{}' ({})".format(clean_text(device.get("id")), "; ".join(details))
+    shown = "'{}'".format(clean_text(device.get("id")))
+    return "{} ({})".format(shown, "; ".join(details)) if details else shown
 
 
 def format_unknown_forced_device_error(device_id: str, devices: Sequence[Mapping[str, Any]]) -> str:
@@ -1524,46 +1538,63 @@ def format_unknown_forced_device_error(device_id: str, devices: Sequence[Mapping
     return "\n".join(lines)
 
 
-def make_device_id(label: str, devices: Iterable[Mapping[str, Any]]) -> str:
+def is_device_id_taken(device_id: str, devices: Iterable[Mapping[str, Any]]) -> bool:
     """
-    Build a unique device id from a label.
+    Tell whether a device id is already used, case-insensitively.
 
-    :param label: Device label chosen by the user.
+    :param device_id: Id to look for.
     :param devices: Existing device entries.
-    :return: Lower-case id made of letters, digits and dashes, suffixed with ``-2``, ``-3``... if taken.
+    :return: ``True`` when an existing device has this id.
     """
-    base = re.sub(r"[^a-z0-9]+", "-", label.casefold()).strip("-") or "device"
-    taken = {device["id"].strip().lower() for device in devices}
+    wanted = device_id.strip().lower()
+    return any(device["id"].strip().lower() == wanted for device in devices)
+
+
+def default_device_id(identity: DeviceIdentity, devices: Iterable[Mapping[str, Any]]) -> str:
+    """
+    Suggest a unique device id from an identification.
+
+    :param identity: Identification of the device.
+    :param devices: Existing device entries.
+    :return: Model (or make) without invalid file name characters nor leading or
+        trailing spaces and dots, so that it passes ``validate_device_id``
+        (``"Device"`` as last resort), suffixed with ``-2``, ``-3``... if taken.
+    """
+    devices = list(devices)
+    text = identity.model or identity.make
+    invalid = set(find_invalid_filename_chars(text))
+    cleaned = "".join(char for char in text if char not in invalid)
+    base = re.sub(r"^[\s.]+|[\s.]+$", "", cleaned) or "Device"
     candidate = base
     counter = 2
-    while candidate in taken:
+    while is_device_id_taken(candidate, devices):
         candidate = "{}-{}".format(base, counter)
         counter += 1
     return candidate
 
 
-def default_label(identity: DeviceIdentity) -> str:
+def validate_device_id_answer(answer: str, devices: Sequence[Mapping[str, Any]] = ()) -> Optional[str]:
     """
-    Suggest a device label from an identification.
+    Validate a device id typed by the user.
 
-    :param identity: Identification of the device.
-    :return: Model (or make) without invalid file name characters nor leading or
-        trailing spaces and dots, so that it passes ``validate_label``; ``"Device"`` as last resort.
+    :param answer: Typed id.
+    :param devices: Existing device entries; the id must not be one of theirs.
+    :return: An error message, or ``None`` when the id is valid (see ``validate_device_id``) and free.
     """
-    text = identity.model or identity.make
-    invalid = set(find_invalid_filename_chars(text))
-    cleaned = "".join(char for char in text if char not in invalid)
-    return re.sub(r"^[\s.]+|[\s.]+$", "", cleaned) or "Device"
+    errors = validate_device_id(answer)
+    if not errors and is_device_id_taken(answer, devices):
+        errors.append("id {!r} is already used by another device".format(answer))
+    return "; ".join(errors) or None
 
 
 def validate_label_answer(answer: str) -> Optional[str]:
     """
-    Validate a device label typed by the user.
+    Accept any device label typed by the user, including an empty one.
 
     :param answer: Typed label.
-    :return: An error message, or ``None`` when the label is valid (see ``validate_label``).
+    :return: Always ``None``: the label is a free description.
     """
-    return "; ".join(validate_label(answer)) or None
+    return None
 
 
 def validate_offset_answer(answer: str) -> Optional[str]:
@@ -1640,7 +1671,7 @@ def prompt_new_device(
     so files of the same model without a serial number still match.
 
     :param identity: Identification of the unknown device.
-    :param devices: Existing device entries, used to build a unique id.
+    :param devices: Existing device entries; the new id must differ from theirs.
     :param input_func: Function reading one line, such as ``input``.
     :param out: Stream for messages.
     :param context: Lines describing the device's files, shown before the questions.
@@ -1650,9 +1681,10 @@ def prompt_new_device(
     print("\nUnknown device: {}".format(describe_identity(identity)), file=out)
     for line in context:
         print("  {}".format(line), file=out)
-    suggestion = default_label(identity)
-    label = ask(input_func, out, "  Label used in file names [{}]: ".format(suggestion),
-                validate_label_answer, suggestion)
+    suggestion = default_device_id(identity, devices)
+    device_id = ask(input_func, out, "  Device id used in file names [{}]: ".format(suggestion),
+                    functools.partial(validate_device_id_answer, devices=devices), suggestion)
+    label = ask(input_func, out, "  Label, a description for you (optional) []: ", validate_label_answer)
     offset = ask(input_func, out, "  Clock offset to apply, signed HH:MM:SS [{}]: ".format(DEFAULT_OFFSET),
                  validate_offset_answer, DEFAULT_OFFSET)
     zone = ask(input_func, out, "  IANA time zone, e.g. Europe/Paris (empty for none) []: ",
@@ -1669,7 +1701,11 @@ def prompt_new_device(
         match["model"] = identity.model
     if use_serial:
         match["serial_number"] = identity.serial_number
-    device = {"id": make_device_id(label, devices), "label": label, "match": match, "offset": offset}
+    device = {"id": device_id}  # type: Dict[str, Any]
+    if label:
+        device["label"] = label
+    device["match"] = match
+    device["offset"] = offset
     if zone:
         device["timezone"] = zone
     return device
@@ -1854,7 +1890,7 @@ def print_analysis(analyses: Sequence[FileAnalysis], out: TextIO) -> None:
             else:
                 shown = analysis.date.isoformat(sep=" ") if analysis.date else "?"
             print("[OK]   {}  {}  device '{}'  ({})".format(
-                name, shown, device.get("label", "?"), describe_date_source(analysis)), file=out)
+                name, shown, device.get("id", "?"), describe_date_source(analysis)), file=out)
             for warning in analysis.effective.warnings if analysis.effective else ():
                 print("       warning: {}".format(warning), file=out)
                 warnings += 1
@@ -1922,13 +1958,13 @@ def sanitize_stem(stem: str) -> str:
     return cleaned
 
 
-def render_stem(pattern: str, date: datetime, label: str, original: str) -> str:
+def render_stem(pattern: str, date: datetime, device_id: str, original: str) -> str:
     """
     Render the file name pattern, without extension.
 
     :param pattern: Validated ``filename_pattern``, e.g. ``"{YYYY}-{MM}-{DD}_{DEVICE}"``.
     :param date: Effective date (its time zone information is ignored).
-    :param label: Device label, used for ``{DEVICE}``.
+    :param device_id: Device id, used for ``{DEVICE}``.
     :param original: Original file name without extension, used for ``{ORIGINAL}``.
     :return: Sanitized name, without extension.
     :raises ValueError: If the pattern contains an unknown token.
@@ -1940,7 +1976,7 @@ def render_stem(pattern: str, date: datetime, label: str, original: str) -> str:
         "HH": "{:02d}".format(date.hour),
         "MIN": "{:02d}".format(date.minute),
         "SEC": "{:02d}".format(date.second),
-        "DEVICE": label,
+        "DEVICE": device_id,
         "ORIGINAL": original,
     }
 
@@ -1972,7 +2008,7 @@ def build_target_stem(analysis: FileAnalysis, pattern: str) -> str:
     date = analysis.effective.value if analysis.effective is not None else analysis.date
     if date is None or analysis.device is None:
         raise ValueError("{}: no date or device to build a name".format(analysis.relative.as_posix()))
-    return render_stem(pattern, date, analysis.device["label"], analysis.relative.stem)
+    return render_stem(pattern, date, analysis.device["id"], analysis.relative.stem)
 
 
 def folder_key(relative: Path) -> str:

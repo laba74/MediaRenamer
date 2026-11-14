@@ -58,10 +58,10 @@ Devices are stored in `conf/devices.json` (see the README for the format). Back 
 
 | Problem | Fix |
 | --- | --- |
-| Wrong label in the names | Change `label`. Already renamed files keep their old names; run again to rename them (the pattern must still match). |
+| Wrong device name in the file names | Change `id`. Already renamed files keep their old names; run again to rename them (the pattern must still match). |
 | A typo was entered when the device was registered | Edit the entry, or restore `conf/devices.json.bak` (the version before the last run that registered devices). |
 | Files go to the wrong device | Entries are tried in file order and the first match wins: move the more specific entry (with `make` and `serial_number`) above the generic one. |
-| Two bodies of the same model need different labels or offsets | Add `serial_number` to each entry's `match`. Files without a serial number (many videos) only match entries whose `model`/`make` match, so keep a generic entry last for them. |
+| Two bodies of the same model need different ids or offsets | Add `serial_number` to each entry's `match`. Files without a serial number (many videos) only match entries whose `model`/`make` match, so keep a generic entry last for them. |
 | A device is asked again at every run | Its `Make`/`Model` in the files differ from `match`: compare them with [Inspect a file's tags](#inspect-a-files-tags). Comparisons ignore case and extra spaces, not other differences. |
 | `duplicate id (already used by device #N)` | Each `id` must be unique (case-insensitive); rename one of them. |
 | Start over for a device | Delete its entry: the program asks again at the next run. |
@@ -115,7 +115,7 @@ Without a zone, names use the camera's wall-clock time, marked `local` in the pr
 | --- | --- |
 | Burst photos get `_01`, `_02` | Several shots in the same second: the pattern has a one-second resolution. Expected; add `{ORIGINAL}` to the pattern to keep them apart. |
 | Photos from two cameras collide | Add `{DEVICE}` to the pattern (it is in the default one). |
-| A second run adds `_01` to files already renamed | Not expected: a file whose name is already its target is `unchanged`. Check that the device label, offset, zone and pattern did not change between runs. |
+| A second run adds `_01` to files already renamed | Not expected: a file whose name is already its target is `unchanged`. Check that the device id, offset, zone and pattern did not change between runs. |
 | Files with only a case difference (`a.JPG` / `A.jpg`) get suffixes | They would overwrite each other on Windows and macOS, so they are kept apart on every system. |
 | Two long names get `_01` although their originals differ | Rendered names are cut to 200 UTF-8 bytes; when `{ORIGINAL}` is long, the end that differs may be cut. Shorten the pattern or the original names. |
 | `NotADirectoryError: a file stands where a folder is needed` | With `--dest`, a file in the destination has the name of a subfolder to create. Rename or move that file. |
@@ -132,7 +132,7 @@ Files in different folders never collide with each other: each folder (or each d
 - invalid JSON (missing comma or quote, trailing comma): the message gives the line and column;
 - unknown token in `filename_pattern` (only `{YYYY}` `{MM}` `{DD}` `{HH}` `{MIN}` `{SEC}` `{DEVICE}` `{ORIGINAL}`), path separators or invalid characters;
 - an extension without a leading dot, or an unknown `log_level`;
-- an offset not in signed `HH:MM:SS` form (minutes and seconds `00`–`59`), a duplicate device `id`, a `match` without `make` or `model`, a label with invalid file name characters or a leading/trailing space or dot, an unknown field.
+- an offset not in signed `HH:MM:SS` form (minutes and seconds `00`–`59`), a duplicate device `id`, a `match` without `make` or `model`, an empty id, or one with invalid file name characters or a leading/trailing space or dot, a label that is not a string, an unknown field.
 
 If a personal file is beyond repair, restore your backup or reset it from its template (see "Back up your personal files" in the README).
 

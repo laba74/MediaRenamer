@@ -40,7 +40,7 @@ Goal: read metadata through ExifTool and match each file to a device.
 - **2.2 ExifTool wrapper** — Run ExifTool via `subprocess` (JSON output), batch calls, handle errors and timeouts.
 - **2.3 Date source selection** — Choose and document the EXIF date tag priority (e.g. `DateTimeOriginal`, `CreateDate`, `MediaCreateDate`); report files with missing/unreadable date and skip them (never use the system date).
 - **2.4 Device matching** — Case-insensitive match on `Make`, `Model`, optional `SerialNumber` (empty serial is not a criterion); first matching entry wins; `--device` forces the device.
-- **2.5 Unknown device handling** — Interactive prompt for label and offset, saved to `conf/devices.json`, reused for all matching files of the batch; resolved before any file modification; clear error in non-interactive mode.
+- **2.5 Unknown device handling** — Interactive prompt for id (used in file names), optional label and offset, saved to `conf/devices.json`, reused for all matching files of the batch; resolved before any file modification; clear error in non-interactive mode.
 
 ### Done — Epic 2
 - [x] On a sample folder, discovery returns the expected files (flat and recursive, nested subfolders, relative paths preserved).
