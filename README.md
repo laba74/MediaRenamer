@@ -14,7 +14,7 @@ GL011892.LRV                ->  2025-07-14_17-19-24_GoPro1.LRV   (follows its ma
 - Renames in place, or copies to a destination folder and leaves the sources untouched.
 - Never writes metadata, never overwrites a file, never uses the file system date, never flattens folders, and does not deduplicate content.
 
-Contents: [Installation](#installation) · [Configuration](#configuration) · [Back up your personal files](#back-up-your-personal-files) · [Usage](#usage) · [Output and log](#output-and-log) · [How files are analyzed](#how-files-are-analyzed) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [License](#license)
+Contents: [Installation](#installation) · [Offline installation](#offline-installation-windows) · [Configuration](#configuration) · [Back up your personal files](#back-up-your-personal-files) · [Usage](#usage) · [Output and log](#output-and-log) · [How files are analyzed](#how-files-are-analyzed) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [License](#license)
 
 ## Installation
 
@@ -84,6 +84,70 @@ uv run python media_renamer.py --source "path/to/photos"
 
 This only prints what would be done. When a camera is not yet in `conf/devices.json`, the program asks for its id, an optional label and its clock offset first (see [Unknown devices](#unknown-devices)). Run the same command with `--apply` once the plan looks right.
 
+### Offline installation (Windows)
+
+To run MediaRenamer on a Windows machine without internet access, download its Python packages as wheels, together with the standalone `uv` executable, on a connected machine, then install them from that folder. The offline machine only needs Python 3.12 or later; `uv` does not have to be installed there.
+
+**On the connected machine** (with `uv`), from the repository root:
+
+```powershell
+# Runtime packages only (tzdata), into wheels\
+.\scripts\build_offline_wheels.ps1
+
+# Also the test tools (pytest), to run the test suite offline
+.\scripts\build_offline_wheels.ps1 -IncludeDev
+
+# Into another folder (relative to the repository root, or absolute)
+.\scripts\build_offline_wheels.ps1 -OutputDir D:\transfer\wheels
+
+# For an ARM64 offline machine (only changes the bundled uv executable)
+.\scripts\build_offline_wheels.ps1 -UvArchitecture aarch64
+
+# Without the uv executable, when the offline machine already has uv
+.\scripts\build_offline_wheels.ps1 -SkipUv
+```
+
+The script:
+
+1. exports the exact versions and hashes locked in `uv.lock` to `wheels\requirements.txt`;
+2. downloads the matching wheels next to it (previous wheels in that folder are removed first);
+3. downloads the official standalone `uv` archive from the [uv releases](https://github.com/astral-sh/uv/releases), in the same version as the local `uv`, checks it against its published SHA-256, and extracts `uv.exe` into `wheels\uv\`. It is a single executable that runs without installation.
+
+If PowerShell refuses to run the script, start it with `powershell -ExecutionPolicy Bypass -File .\scripts\build_offline_wheels.ps1`. `wheels/` is git-ignored.
+
+Copy to the offline machine:
+
+- the whole repository folder, `wheels\` included (plus your backed-up `conf\config.json` and `conf\devices.json`, see [Back up your personal files](#back-up-your-personal-files));
+- ExifTool, extracted into `bin\` as described in [Install ExifTool](#3-install-exiftool);
+- the Python 3.12 or later installer (from [python.org](https://www.python.org/downloads/windows/)), if the offline machine does not have Python yet. `uv` cannot download Python without internet: it uses the Python already installed.
+
+**On the offline machine**, in PowerShell, from the repository root:
+
+```powershell
+# 0. Use the bundled uv for this PowerShell session (repeat in each new session)
+$env:PATH = "$PWD\wheels\uv;$env:PATH"
+
+# 1. Once: create .venv\ and install the wheels, from the local folder only
+uv venv --offline
+uv pip install --offline --no-index --find-links wheels --requirement wheels\requirements.txt
+
+# 2. Check the installation
+uv run --offline --no-sync python media_renamer.py --check
+
+# 3. Preview, then apply
+uv run --offline --no-sync python media_renamer.py --source "D:\Photos\2025"
+uv run --offline --no-sync python media_renamer.py --source "D:\Photos\2025" --apply
+
+# Tests (only with wheels built with -IncludeDev)
+uv run --offline --no-sync pytest
+```
+
+`--offline` forbids any network access and `--no-sync` stops `uv run` from syncing the project with `uv.lock`, which would need the packages that were left out (such as `pytest`) and the network. `uv sync` is not used for the same reason. Every option described in [Usage](#usage) works the same way: insert `--offline --no-sync` after `uv run`. To avoid typing them, set them once per PowerShell session with `$env:UV_OFFLINE = "1"; $env:UV_NO_SYNC = "1"`, then use the usual `uv run python media_renamer.py ...` commands.
+
+Without step 0, call the executable by its path instead of `uv`, e.g. `.\wheels\uv\uv.exe run --offline --no-sync python media_renamer.py --check`.
+
+The wheels are platform-specific in general: build them on Windows for a Windows machine. When `uv.lock` changes (new dependency or version), run the script again and copy the new `wheels\` folder.
+
 ## Configuration
 
 The configuration lives in `conf/`:
@@ -103,7 +167,7 @@ An existing personal file is never overwritten by a template. `devices.json` is 
 ```json
 {
   "filename_pattern": "{YYYY}-{MM}-{DD}_{HH}-{MIN}-{SEC}_{DEVICE}",
-  "supported_extensions": [".mp4", ".mov", ".lrv", ".thm", ".wav", ".mp3", ".jpg", ".jpeg", ".png", ".heic", ".nef", ".arw", ".cr2", ".cr3", ".dng"],
+  "supported_extensions": [".mp4", ".mov", ".lrv", ".lrf", ".thm", ".wav", ".mp3", ".jpg", ".jpeg", ".png", ".heic", ".nef", ".arw", ".cr2", ".cr3", ".dng"],
   "dry_run_by_default": true,
   "log_level": "INFO"
 }
@@ -219,13 +283,13 @@ On Windows, quote paths containing spaces: `--source "D:\My Photos\2025"`.
 - **Rename in place** (no `--dest`): the file gets its new name in its own folder.
 - **Copy** (`--dest`): the file is copied under its new name; with `--recursive`, into the same relative subfolder under the destination. Only folders that receive at least one file are created (no empty folders). A destination inside the source is not scanned.
 - **Unchanged**: the file already has its target name.
-- **Skipped**: no valid date, no device, orphan GoPro auxiliary file… The reason is printed.
+- **Skipped**: no valid date, no device, orphan auxiliary file… The reason is printed.
 - **Collisions**: when two files would get the same name in the same folder, or the name is already taken there, `_01`, `_02`… is added before the extension. Names are compared case-insensitively and regardless of Unicode normalization (`é` composed or decomposed), so the result is safe on Windows and macOS.
 - **No overwrite**: an existing file is never replaced; if a target appears between the plan and the operation, the file is reported as an error and left alone.
 
-### GoPro auxiliary files
+### Auxiliary files (GoPro, DJI)
 
-`.LRV` (low-resolution video), `.THM` (thumbnail) and GoPro `.WAV` (RAW audio) files are not dated on their own: they take the name, date and device of their main video (`.MP4`/`.MOV`) in the **same folder**, and keep their extension. They are matched by identical base name (`GH011892.MP4` / `GH011892.THM`), or by the GoPro file id that ends the name (`GL011892.LRV` follows `GH011892.MP4`, also when another tool added a prefix to the names). Without a main video in its folder, an auxiliary file is reported and not renamed.
+`.LRV` (GoPro low-resolution video), `.LRF` (DJI low-resolution video), `.THM` (thumbnail) and camera `.WAV` files (GoPro RAW audio, DJI separate audio track) are not dated on their own: they take the name, date and device of their main video (`.MP4`/`.MOV`) in the **same folder**, and keep their extension. They are matched by identical base name (`GH011892.MP4` / `GH011892.THM`, `DJI_20260307110012_0426_D.MP4` / `DJI_20260307110012_0426_D.WAV`), or by the camera file id that ends the name (`GL011892.LRV` follows `GH011892.MP4`, also when another tool added a prefix to the names). A `.WAV` file is auxiliary only when its name ends with a GoPro or DJI file id; other `.wav` files are regular media. Without a main video in its folder, an auxiliary file is reported and not renamed.
 
 ## Output and log
 
@@ -285,7 +349,7 @@ The date used in file names (the *effective date*) is computed in two steps. The
 ### Limits of zone-less metadata
 
 - Most EXIF dates and many video dates carry no zone: they are the camera's wall-clock time, whatever the zone it was set to. Without `--tz` or a device `timezone`, file names use that wall-clock time as is.
-- QuickTime dates (`CreateDate`, `MediaCreateDate`, `TrackCreateDate` in videos) are UTC according to the specification, but many cameras (GoPro among them) store local time. ExifTool returns them as they are, and they are treated as zone-less local time. If a camera really writes UTC, set its device `timezone` to `UTC`, or adjust its `offset`.
+- QuickTime dates (`CreateDate`, `MediaCreateDate`, `TrackCreateDate` in videos) are UTC according to the specification, but many cameras (GoPro among them) store local time. ExifTool returns them as they are, and they are treated as zone-less local time. If a camera really writes UTC (DJI Osmo Action cameras do), set its device `timezone` to `UTC`, or adjust its `offset`.
 - A zone applies to the whole batch (`--tz`) or to a whole device: photos taken while travelling across zones need separate runs, or the camera clock set to the local zone.
 
 ### Device matching
@@ -294,6 +358,7 @@ Each file is matched against `conf/devices.json`, in file order; the first match
 
 - `model`, when set in an entry, must match.
 - `make` and `serial_number` are only compared when the file provides them: many videos (e.g. GoPro MP4 files) have a model but no make or serial number.
+- A file with neither `Make` nor `Model` but an `Encoder` tag naming a camera (DJI Osmo Action videos, e.g. `DJI OsmoAction5 Pro`) uses that encoder as its model. Other encoders (e.g. `Lavf58.76.100` from re-encoding software) are ignored.
 - An empty criterion is ignored.
 
 `--device ID` forces the device for the whole batch.

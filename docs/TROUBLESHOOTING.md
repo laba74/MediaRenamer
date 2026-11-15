@@ -38,10 +38,10 @@ exiftool -ver
 
 ## Inspect a file's tags
 
-MediaRenamer reads only these tags: `DateTimeOriginal`, `CreateDate`, `MediaCreateDate`, `TrackCreateDate` (dates, in this priority), `OffsetTimeOriginal`, `OffsetTimeDigitized` (UTC offsets), `Make`, `Model`, `SerialNumber` (device identification), and `Software`, `FirmwareVersion` (only shown to help recognize an unknown device, never used for matching). To see what ExifTool returns for one file:
+MediaRenamer reads only these tags: `DateTimeOriginal`, `CreateDate`, `MediaCreateDate`, `TrackCreateDate` (dates, in this priority), `OffsetTimeOriginal`, `OffsetTimeDigitized` (UTC offsets), `Make`, `Model`, `SerialNumber`, `Encoder` (device identification; `Encoder` only stands for a missing model when it names a camera, e.g. DJI), and `Software`, `FirmwareVersion` (only shown to help recognize an unknown device, never used for matching). To see what ExifTool returns for one file:
 
 ```sh
-exiftool -s -DateTimeOriginal -CreateDate -MediaCreateDate -TrackCreateDate -OffsetTimeOriginal -OffsetTimeDigitized -Make -Model -SerialNumber -Software -FirmwareVersion FILE
+exiftool -s -DateTimeOriginal -CreateDate -MediaCreateDate -TrackCreateDate -OffsetTimeOriginal -OffsetTimeDigitized -Make -Model -SerialNumber -Encoder -Software -FirmwareVersion FILE
 ```
 
 To list every date of the file with the group it comes from:
@@ -99,7 +99,7 @@ Without a zone, names use the camera's wall-clock time, marked `local` in the pr
 
 | Symptom | Explanation / fix |
 | --- | --- |
-| Videos are a few hours off compared with photos | QuickTime dates are UTC in theory, but many cameras (GoPro included) write local time. They are treated as local. If a camera really writes UTC, set its `timezone` to `UTC`; otherwise correct it with its `offset`. |
+| Videos are a few hours off compared with photos | QuickTime dates are UTC in theory, but many cameras (GoPro included) write local time. They are treated as local. If a camera really writes UTC (e.g. DJI Osmo Action), set its `timezone` to `UTC`; otherwise correct it with its `offset`. |
 | Some files are `UTC`, others `local` in one batch | Files with a stored UTC offset (`OffsetTime*` tags, many phones) are always converted; give `--tz` or the device `timezone` so the others are converted too. |
 | `... occurs twice (clocks set back) in Europe/Paris: local time kept` | The local time exists twice on the night clocks go back; it cannot be converted reliably. The file keeps its local time; rename it by hand if needed. |
 | `... does not exist (clocks set forward) ...` | Same, for the hour skipped when clocks go forward (usually a wrong camera clock). |
@@ -140,7 +140,7 @@ If a personal file is beyond repair, restore your backup or reset it from its te
 
 | Message | Meaning |
 | --- | --- |
-| `no main video with the same base name in its folder; not renamed` | A GoPro `.LRV`/`.THM`/`.WAV` without its `.MP4`/`.MOV` in the same folder. Process the folder that holds both, or rename it by hand. |
+| `no main video with the same base name in its folder; not renamed` | A GoPro `.LRV`/`.THM`/`.WAV` or DJI `.LRF`/`.WAV` without its `.MP4`/`.MOV` in the same folder. Process the folder that holds both, or rename it by hand. |
 | `main video ... is skipped; not renamed` | The auxiliary file follows a video that has no valid date or device: fix the video first. |
 | `another .LRV file already follows ...; not renamed` | Two auxiliary files of the same type (e.g. `GH011892.LRV` and `GL011892.LRV`) match one video: only the first one, in name order, follows it. Rename the other by hand or remove the duplicate. |
 | `[WARNING] Log file disabled: cannot write ...` | `.logs/` is not writable; the run continues without a log. |

@@ -70,13 +70,16 @@ LOGGER_NAME = "media_renamer"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 # Shorter secrets are not redacted from the log: they could match dates or counters.
 MIN_REDACTED_LENGTH = 5
-AUXILIARY_EXTENSIONS = (".lrv", ".thm")
-# GoPro "RAW audio" files (GH<n>.WAV) follow their main video too, but only
-# when their name holds a GoPro file id: other .wav files are regular media.
-GOPRO_AUDIO_EXTENSIONS = (".wav",)
-# GoPro file id at the end of a base name (GOPR0123, GP010123, GH010123,
-# GX010123, GL010123), possibly after a prefix added by another tool.
-GOPRO_FILE_ID_RE = re.compile(r"(?<![a-z0-9])(gopr\d{4}|g[phxl]\d{6})$")
+# Low-resolution proxies (GoPro .LRV, DJI .LRF) and thumbnails (.THM).
+AUXILIARY_EXTENSIONS = (".lrv", ".lrf", ".thm")
+# Separate audio files (GoPro "RAW audio" GH<n>.WAV, DJI DJI_<date>_<n>_<x>.WAV)
+# follow their main video too, but only when their name holds a camera file id:
+# other .wav files are regular media.
+CAMERA_AUDIO_EXTENSIONS = (".wav",)
+# Camera file id at the end of a base name, possibly after a prefix added by
+# another tool: GoPro (GOPR0123, GP010123, GH010123, GX010123, GL010123) or
+# DJI (DJI_20260307110012_0426_D).
+CAMERA_FILE_ID_RE = re.compile(r"(?<![a-z0-9])(gopr\d{4}|g[phxl]\d{6}|dji_\d{14}_\d{4}_[a-z])$")
 
 # Capture date tags, by decreasing priority. The first one holding a valid date
 # wins. File system dates (FileModifyDate...) are never used.
@@ -84,12 +87,19 @@ DATE_TAGS = ("DateTimeOriginal", "CreateDate", "MediaCreateDate", "TrackCreateDa
 # EXIF 2.31 offset tags giving the UTC offset of a zone-less date tag.
 DATE_OFFSET_TAGS = {"DateTimeOriginal": "OffsetTimeOriginal", "CreateDate": "OffsetTimeDigitized"}
 IDENTITY_TAGS = ("Make", "Model", "SerialNumber")
+# Some cameras (DJI Osmo Action) store their model only in a timed metadata
+# track, costly to read; their encoder tag then names the model. It is used
+# when Make and Model are both absent and it starts with one of these prefixes
+# (other encoders, such as "Lavf58.76.100", name software, not a device).
+ENCODER_TAG = "Encoder"
+ENCODER_MODEL_PREFIXES = ("DJI ",)
 # Shown to help the user recognize an unknown device, never used for matching
 # (a firmware update would otherwise look like a new device). First non-empty wins.
 SOFTWARE_TAGS = ("Software", "FirmwareVersion")
 # Only these tags are requested from ExifTool, so GPS and other personal data
 # never enter the program.
-METADATA_TAGS = DATE_TAGS + tuple(DATE_OFFSET_TAGS.values()) + IDENTITY_TAGS + SOFTWARE_TAGS + ("Error",)
+METADATA_TAGS = (DATE_TAGS + tuple(DATE_OFFSET_TAGS.values()) + IDENTITY_TAGS + (ENCODER_TAG,)
+                 + SOFTWARE_TAGS + ("Error",))
 # Number of example file names shown for an unknown device.
 UNKNOWN_DEVICE_EXAMPLES = 3
 EXIF_DATE_RE = re.compile(
@@ -115,7 +125,7 @@ ACTION_RENAME = "rename"
 ACTION_COPY = "copy"
 ACTION_UNCHANGED = "unchanged"
 ACTION_SKIP = "skip"
-# Extensions of the main videos that GoPro auxiliary files (.LRV, .THM, .WAV) follow.
+# Extensions of the main videos that auxiliary files (.LRV, .LRF, .THM, .WAV) follow.
 MAIN_VIDEO_EXTENSIONS = (".mp4", ".mov")
 # GoPro HERO6+ names the low-resolution video GL<n>.LRV next to GH<n>.MP4 / GX<n>.MP4.
 GOPRO_LRV_PREFIX = "gl"
@@ -1306,14 +1316,19 @@ def extract_identity(metadata: Mapping[str, Any]) -> DeviceIdentity:
     """
     Read the camera identification of a file.
 
+    Without make nor model, an encoder tag naming a camera
+    (``ENCODER_MODEL_PREFIXES``, e.g. ``"DJI OsmoAction5 Pro"``) is used as model.
+
     :param metadata: Tags returned by ExifTool for the file.
     :return: Make, model and serial number (empty when absent).
     """
-    return DeviceIdentity(
-        clean_text(metadata.get("Make")),
-        clean_text(metadata.get("Model")),
-        clean_text(metadata.get("SerialNumber")),
-    )
+    make = clean_text(metadata.get("Make"))
+    model = clean_text(metadata.get("Model"))
+    if not make and not model:
+        encoder = clean_text(metadata.get(ENCODER_TAG))
+        if encoder.startswith(ENCODER_MODEL_PREFIXES):
+            model = encoder
+    return DeviceIdentity(make, model, clean_text(metadata.get("SerialNumber")))
 
 
 def extract_software(metadata: Mapping[str, Any]) -> str:
@@ -1385,8 +1400,8 @@ def analyze_file(
     """
     Decide the capture date and device of one file.
 
-    GoPro auxiliary files (``.LRV``, ``.THM``, and ``.WAV`` named with a GoPro
-    file id) are only flagged: they take the date and device of their main
+    Auxiliary files (``.LRV``, ``.LRF``, ``.THM``, and ``.WAV`` named with a
+    GoPro or DJI file id) are only flagged: they take the date and device of their main
     video later. Files without readable metadata,
     without a valid capture date or without any make/model are skipped; the
     system date is never used.
@@ -1820,7 +1835,7 @@ def analyze_source(
     Discover the files of a source folder, read their metadata, identify their devices
     and compute their effective dates.
 
-    Source files are only read. GoPro auxiliary files are not sent to
+    Source files are only read. Auxiliary files are not sent to
     ExifTool: they take the date and device of their main video. Unknown
     devices are resolved before returning.
 
@@ -2025,26 +2040,27 @@ def folder_key(relative: Path) -> str:
     return relative.parent.as_posix()
 
 
-def gopro_file_id(stem: str) -> Optional[str]:
+def camera_file_id(stem: str) -> Optional[str]:
     """
-    Extract the GoPro file id ending a base name.
+    Extract the GoPro or DJI file id ending a base name.
 
     The id may follow a prefix added by another tool, separated by a
     non-alphanumeric character (e.g. ``2025-07-14_19-19-24_GH011892``).
 
     :param stem: File name without extension.
-    :return: Case-folded id such as ``gh011892``, or ``None`` when absent.
+    :return: Case-folded id such as ``gh011892`` or ``dji_20260307110012_0426_d``,
+        or ``None`` when absent.
     """
-    match = GOPRO_FILE_ID_RE.search(stem.casefold())
+    match = CAMERA_FILE_ID_RE.search(stem.casefold())
     return match.group(1) if match else None
 
 
 def is_auxiliary_file(relative: Path) -> bool:
     """
-    Tell whether a file is a GoPro auxiliary file following a main video.
+    Tell whether a file is an auxiliary file following a main video.
 
-    ``.LRV`` and ``.THM`` files always are; ``.WAV`` files only when their name
-    ends with a GoPro file id (GoPro "RAW audio").
+    ``.LRV``, ``.LRF`` and ``.THM`` files always are; ``.WAV`` files only when
+    their name ends with a GoPro or DJI file id (separate camera audio).
 
     :param relative: File path relative to the source folder.
     :return: ``True`` for an auxiliary file.
@@ -2052,12 +2068,12 @@ def is_auxiliary_file(relative: Path) -> bool:
     suffix = relative.suffix.lower()
     if suffix in AUXILIARY_EXTENSIONS:
         return True
-    return suffix in GOPRO_AUDIO_EXTENSIONS and gopro_file_id(relative.stem) is not None
+    return suffix in CAMERA_AUDIO_EXTENSIONS and camera_file_id(relative.stem) is not None
 
 
 def main_video_stems(auxiliary_stem: str) -> List[str]:
     """
-    List the base names a GoPro auxiliary file may share with its main video.
+    List the base names an auxiliary file may share with its main video.
 
     The same base name comes first; a HERO6+ low-resolution video ``GL<n>``
     also follows ``GH<n>`` then ``GX<n>``.
@@ -2076,12 +2092,12 @@ def group_auxiliaries(
     analyses: Sequence[FileAnalysis],
 ) -> Tuple[Dict[Path, List[FileAnalysis]], Dict[Path, str]]:
     """
-    Link GoPro auxiliary files (``.LRV``, ``.THM``, ``.WAV``) to their main video.
+    Link auxiliary files (``.LRV``, ``.LRF``, ``.THM``, ``.WAV``) to their main video.
 
     The main video must be in the same folder, have a ``MAIN_VIDEO_EXTENSIONS``
     extension, share the base name (see ``main_video_stems``) and be ready to
-    rename. When no base name matches, the GoPro file ids ending both names
-    are compared the same way (see ``gopro_file_id``), so files whose names
+    rename. When no base name matches, the camera file ids ending both names
+    are compared the same way (see ``camera_file_id``), so files whose names
     were prefixed differently by another tool are still linked. A main video
     takes at most one auxiliary file per extension.
 
@@ -2096,7 +2112,7 @@ def group_auxiliaries(
         if analysis.status != STATUS_AUXILIARY and analysis.relative.suffix.lower() in MAIN_VIDEO_EXTENSIONS:
             folder = folder_key(analysis.relative)
             mains.setdefault((folder, analysis.relative.stem.casefold()), analysis)
-            main_id = gopro_file_id(analysis.relative.stem)
+            main_id = camera_file_id(analysis.relative.stem)
             if main_id is not None:
                 mains_by_id.setdefault((folder, main_id), analysis)
     auxiliaries = {}  # type: Dict[Path, List[FileAnalysis]]
@@ -2107,7 +2123,7 @@ def group_auxiliaries(
         relative = analysis.relative
         folder = folder_key(relative)
         lookups = [(mains, stem) for stem in main_video_stems(relative.stem)]
-        auxiliary_id = gopro_file_id(relative.stem)
+        auxiliary_id = camera_file_id(relative.stem)
         if auxiliary_id is not None:
             lookups.extend((mains_by_id, file_id) for file_id in main_video_stems(auxiliary_id))
         main = None
@@ -2189,7 +2205,7 @@ def build_plan(
     place) or under ``dest_root`` (copy). Collisions are resolved per target
     folder against the planned names and the files already present there;
     existing files are never targeted, except a file keeping its own name in
-    place. GoPro auxiliary files take the final name of their main video with
+    place. Auxiliary files take the final name of their main video with
     their own extension. Files are only listed, never modified.
 
     :param analyses: File analyses, with every device resolved and effective dates computed.

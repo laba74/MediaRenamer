@@ -1283,7 +1283,7 @@ def test_build_exiftool_command() -> None:
     command = mr.build_exiftool_command(Path("exiftool"), Path("list.args"))
     assert command[0] == "exiftool" and "-json" in command
     assert command[-2:] == ["-@", "list.args"]
-    assert "-DateTimeOriginal" in command and "-SerialNumber" in command
+    assert "-DateTimeOriginal" in command and "-SerialNumber" in command and "-Encoder" in command
     assert not any("GPS" in part for part in command)
 
 
@@ -1806,6 +1806,27 @@ def test_extract_identity() -> None:
     identity = mr.extract_identity({"Make": "GoPro ", "Model": "HERO9 Black", "SerialNumber": 123})
     assert identity == mr.DeviceIdentity("GoPro", "HERO9 Black", "123")
     assert mr.extract_identity({}) == mr.DeviceIdentity("", "", "")
+
+
+def test_extract_identity_uses_camera_encoder_as_model() -> None:
+    """
+    Check that a camera encoder tag stands for the model only without make nor model.
+    """
+    dji = {"Encoder": " DJI OsmoAction5 Pro "}
+    assert mr.extract_identity(dji) == mr.DeviceIdentity("", "DJI OsmoAction5 Pro", "")
+    assert mr.extract_identity({"Encoder": "Lavf58.76.100"}) == mr.DeviceIdentity("", "", "")
+    assert mr.extract_identity({"Encoder": "DJI X", "Model": "HERO9 Black"}).model == "HERO9 Black"
+    assert mr.extract_identity({"Encoder": "DJI X", "Make": "DJI"}) == mr.DeviceIdentity("DJI", "", "")
+
+
+def test_analyze_file_identifies_dji_video_by_encoder() -> None:
+    """
+    Check that a DJI video without Make/Model is matched through its encoder tag.
+    """
+    device = make_device(id="Osmo5", match={"model": "DJI OsmoAction5 Pro"})
+    metadata = {"CreateDate": "2026:03:07 10:00:13", "Encoder": "DJI OsmoAction5 Pro"}
+    analysis = mr.analyze_file(Path("DJI_20260307110012_0426_D.MP4"), metadata, None, [device])
+    assert analysis.status == mr.STATUS_READY and analysis.device is device
 
 
 def test_extract_software() -> None:
@@ -2372,7 +2393,7 @@ def ready(name: str, when: datetime = WHEN, device_id: str = "GoPro9", warnings:
 
 def auxiliary(name: str) -> mr.FileAnalysis:
     """
-    Build the analysis of a GoPro auxiliary file.
+    Build the analysis of an auxiliary file.
 
     :param name: Relative path of the file.
     :return: File analysis.
@@ -2484,25 +2505,32 @@ def test_build_plan_lists_existing_names_per_folder_case(tmp_path: Path) -> None
     assert targets(plan)["a/y.jpg"] == "a/" + BASE + "_01.jpg"
 
 
-def test_gopro_file_id() -> None:
+def test_camera_file_id() -> None:
     """
-    Check the GoPro file id at the end of a base name, with or without prefix.
+    Check the GoPro or DJI file id at the end of a base name, with or without prefix.
     """
-    assert mr.gopro_file_id("GH011892") == "gh011892"
-    assert mr.gopro_file_id("2025-07-14_19-19-24_2025-07-14_13-19-24_GL011892") == "gl011892"
-    assert mr.gopro_file_id("trip GOPR2098") == "gopr2098"
-    assert mr.gopro_file_id("GP010123") == "gp010123"
-    assert mr.gopro_file_id("XGH011892") is None
-    assert mr.gopro_file_id("GH011892_01") is None
-    assert mr.gopro_file_id("GH01189") is None
-    assert mr.gopro_file_id("holiday") is None
+    assert mr.camera_file_id("GH011892") == "gh011892"
+    assert mr.camera_file_id("2025-07-14_19-19-24_2025-07-14_13-19-24_GL011892") == "gl011892"
+    assert mr.camera_file_id("trip GOPR2098") == "gopr2098"
+    assert mr.camera_file_id("GP010123") == "gp010123"
+    assert mr.camera_file_id("XGH011892") is None
+    assert mr.camera_file_id("GH011892_01") is None
+    assert mr.camera_file_id("GH01189") is None
+    assert mr.camera_file_id("holiday") is None
+    assert mr.camera_file_id("DJI_20260307110012_0426_D") == "dji_20260307110012_0426_d"
+    assert mr.camera_file_id("2026-03-07_10-00-13_DJI_20260307110012_0426_D") == "dji_20260307110012_0426_d"
+    assert mr.camera_file_id("XDJI_20260307110012_0426_D") is None
+    assert mr.camera_file_id("DJI_20260307110012_0426") is None
+    assert mr.camera_file_id("DJI_0426") is None
 
 
 def test_is_auxiliary_file() -> None:
     """
-    Check that .LRV/.THM always follow a video and .WAV only with a GoPro file id.
+    Check that .LRV/.LRF/.THM always follow a video and .WAV only with a camera file id.
     """
     assert mr.is_auxiliary_file(Path("a.LRV"))
+    assert mr.is_auxiliary_file(Path("DJI_20260307110012_0426_D.LRF"))
+    assert mr.is_auxiliary_file(Path("DJI_20260307110012_0426_D.WAV"))
     assert mr.is_auxiliary_file(Path("sub/a.thm"))
     assert mr.is_auxiliary_file(Path("prefix_GH011905.WAV"))
     assert not mr.is_auxiliary_file(Path("interview.wav"))
@@ -2552,6 +2580,20 @@ def test_group_auxiliaries_by_gopro_file_id() -> None:
                                              "2025-07-14_19-19-24_GL011892.lrv",
                                              "2025-07-15_18-25-20_GH011892.wav"]}
     assert set(orphans) == {Path("2025-07-14_23-29-07_GL011898.lrv"), Path("sub/x_GH011892.thm")}
+
+
+def test_group_auxiliaries_dji_files() -> None:
+    """
+    Check that DJI audio and proxy files follow their video, by name or by DJI file id.
+    """
+    analyses = [
+        ready("DJI_20260307110012_0426_D.MP4"), auxiliary("DJI_20260307110012_0426_D.WAV"),
+        auxiliary("x_DJI_20260307110012_0426_D.LRF"), auxiliary("DJI_20260307110500_0427_D.WAV"),
+    ]
+    groups, orphans = mr.group_auxiliaries(analyses)
+    assert {main.as_posix(): [aux.relative.name for aux in auxes] for main, auxes in groups.items()} == {
+        "DJI_20260307110012_0426_D.MP4": ["DJI_20260307110012_0426_D.WAV", "x_DJI_20260307110012_0426_D.LRF"]}
+    assert set(orphans) == {Path("DJI_20260307110500_0427_D.WAV")}
 
 
 def test_group_auxiliaries_same_name_wins_over_file_id() -> None:

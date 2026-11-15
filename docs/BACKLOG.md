@@ -82,6 +82,8 @@ Goal: build the target names once, shared by preview and apply.
 - [x] Tests: collisions inside the batch, with existing files, case-only differences.
 - [x] Tests: `.LRV`/`.THM` follow the main video; orphan auxiliary is warned and not renamed.
 - [x] Tests: auxiliary files and GoPro `.WAV` follow their main video by GoPro file id when prefixes differ.
+- [x] Tests: DJI `.WAV` (separate audio) and `.LRF` (proxy) follow their main video by name or DJI file id (`DJI_<date>_<n>_<x>`).
+- [x] Tests: a DJI video without `Make`/`Model` is identified by its `Encoder` tag.
 - [x] Tests: same base name in two different subfolders yields no cross-folder pairing and no cross-folder collision suffix.
 - [x] Plan generation touches no file.
 
