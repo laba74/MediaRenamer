@@ -2,6 +2,7 @@
 
 import argparse
 import errno
+import functools
 import json
 import logging
 import os
@@ -51,8 +52,8 @@ CONFIG_KEYS = ("filename_pattern", "supported_extensions", "dry_run_by_default",
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 EXTENSION_RE = re.compile(r"^\.[A-Za-z0-9]+$")
 
-DEVICE_REQUIRED_KEYS = ("id", "label", "match", "offset")
-DEVICE_OPTIONAL_KEYS = ("timezone",)
+DEVICE_REQUIRED_KEYS = ("id", "match", "offset")
+DEVICE_OPTIONAL_KEYS = ("label", "timezone")
 MATCH_KEYS = ("make", "model", "serial_number")
 OFFSET_RE = re.compile(r"^([+-])?(\d{2,}):([0-5]\d):([0-5]\d)$")
 TIMEZONE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+)*$")
@@ -69,13 +70,16 @@ LOGGER_NAME = "media_renamer"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 # Shorter secrets are not redacted from the log: they could match dates or counters.
 MIN_REDACTED_LENGTH = 5
-AUXILIARY_EXTENSIONS = (".lrv", ".thm")
-# GoPro "RAW audio" files (GH<n>.WAV) follow their main video too, but only
-# when their name holds a GoPro file id: other .wav files are regular media.
-GOPRO_AUDIO_EXTENSIONS = (".wav",)
-# GoPro file id at the end of a base name (GOPR0123, GP010123, GH010123,
-# GX010123, GL010123), possibly after a prefix added by another tool.
-GOPRO_FILE_ID_RE = re.compile(r"(?<![a-z0-9])(gopr\d{4}|g[phxl]\d{6})$")
+# Low-resolution proxies (GoPro .LRV, DJI .LRF) and thumbnails (.THM).
+AUXILIARY_EXTENSIONS = (".lrv", ".lrf", ".thm")
+# Separate audio files (GoPro "RAW audio" GH<n>.WAV, DJI DJI_<date>_<n>_<x>.WAV)
+# follow their main video too, but only when their name holds a camera file id:
+# other .wav files are regular media.
+CAMERA_AUDIO_EXTENSIONS = (".wav",)
+# Camera file id at the end of a base name, possibly after a prefix added by
+# another tool: GoPro (GOPR0123, GP010123, GH010123, GX010123, GL010123) or
+# DJI (DJI_20260307110012_0426_D).
+CAMERA_FILE_ID_RE = re.compile(r"(?<![a-z0-9])(gopr\d{4}|g[phxl]\d{6}|dji_\d{14}_\d{4}_[a-z])$")
 
 # Capture date tags, by decreasing priority. The first one holding a valid date
 # wins. File system dates (FileModifyDate...) are never used.
@@ -83,12 +87,19 @@ DATE_TAGS = ("DateTimeOriginal", "CreateDate", "MediaCreateDate", "TrackCreateDa
 # EXIF 2.31 offset tags giving the UTC offset of a zone-less date tag.
 DATE_OFFSET_TAGS = {"DateTimeOriginal": "OffsetTimeOriginal", "CreateDate": "OffsetTimeDigitized"}
 IDENTITY_TAGS = ("Make", "Model", "SerialNumber")
+# Some cameras (DJI Osmo Action) store their model only in a timed metadata
+# track, costly to read; their encoder tag then names the model. It is used
+# when Make and Model are both absent and it starts with one of these prefixes
+# (other encoders, such as "Lavf58.76.100", name software, not a device).
+ENCODER_TAG = "Encoder"
+ENCODER_MODEL_PREFIXES = ("DJI ",)
 # Shown to help the user recognize an unknown device, never used for matching
 # (a firmware update would otherwise look like a new device). First non-empty wins.
 SOFTWARE_TAGS = ("Software", "FirmwareVersion")
 # Only these tags are requested from ExifTool, so GPS and other personal data
 # never enter the program.
-METADATA_TAGS = DATE_TAGS + tuple(DATE_OFFSET_TAGS.values()) + IDENTITY_TAGS + SOFTWARE_TAGS + ("Error",)
+METADATA_TAGS = (DATE_TAGS + tuple(DATE_OFFSET_TAGS.values()) + IDENTITY_TAGS + (ENCODER_TAG,)
+                 + SOFTWARE_TAGS + ("Error",))
 # Number of example file names shown for an unknown device.
 UNKNOWN_DEVICE_EXAMPLES = 3
 EXIF_DATE_RE = re.compile(
@@ -114,7 +125,7 @@ ACTION_RENAME = "rename"
 ACTION_COPY = "copy"
 ACTION_UNCHANGED = "unchanged"
 ACTION_SKIP = "skip"
-# Extensions of the main videos that GoPro auxiliary files (.LRV, .THM, .WAV) follow.
+# Extensions of the main videos that auxiliary files (.LRV, .LRF, .THM, .WAV) follow.
 MAIN_VIDEO_EXTENSIONS = (".mp4", ".mov")
 # GoPro HERO6+ names the low-resolution video GL<n>.LRV next to GH<n>.MP4 / GX<n>.MP4.
 GOPRO_LRV_PREFIX = "gl"
@@ -525,33 +536,43 @@ def validate_timezone(name: Any, available: Optional[Set[str]] = None) -> Option
     return None
 
 
-def validate_label(label: Any) -> List[str]:
+def validate_device_id(device_id: Any) -> List[str]:
     """
-    Validate a device label, inserted in file names by ``{DEVICE}``.
+    Validate a device id, inserted in file names by ``{DEVICE}``.
 
-    The label must be valid in file names on every common system (Windows,
+    The id must be valid in file names on every common system (Windows,
     macOS, Linux, Android): no forbidden character (see
     ``find_invalid_filename_chars``), and no leading or trailing space or dot,
     which some systems strip or refuse.
 
-    :param label: Label to check.
-    :return: Error messages; empty when the label is valid.
+    :param device_id: Id to check.
+    :return: Error messages; empty when the id is valid.
     """
-    if not isinstance(label, str) or not label.strip():
-        return ["'label' must be a non-empty string"]
+    if not isinstance(device_id, str) or not device_id.strip():
+        return ["'id' must be a non-empty string"]
     errors = []
-    invalid = find_invalid_filename_chars(label)
+    invalid = find_invalid_filename_chars(device_id)
     if invalid:
         errors.append(
-            "'label' contains invalid file name characters: {}".format(
+            "'id' contains invalid file name characters: {}".format(
                 " ".join(repr(char) for char in invalid)
             )
         )
-    if label != label.strip():
-        errors.append("'label' must not start or end with a space")
-    if label.startswith(".") or label.endswith("."):
-        errors.append("'label' must not start or end with '.'")
+    if device_id != device_id.strip():
+        errors.append("'id' must not start or end with a space")
+    if device_id.startswith(".") or device_id.endswith("."):
+        errors.append("'id' must not start or end with '.'")
     return errors
+
+
+def validate_label(label: Any) -> List[str]:
+    """
+    Validate a device label: an optional free description for the user, never used in file names.
+
+    :param label: Label to check.
+    :return: Error messages; empty when the label is a string, even an empty one.
+    """
+    return [] if isinstance(label, str) else ["'label' must be a string"]
 
 
 def validate_match(match: Any) -> List[str]:
@@ -591,8 +612,8 @@ def validate_device(device: Any, available_timezones: Optional[Set[str]] = None)
     for key in DEVICE_REQUIRED_KEYS:
         if key not in device:
             errors.append("missing field '{}'".format(key))
-    if "id" in device and (not isinstance(device["id"], str) or not device["id"].strip()):
-        errors.append("'id' must be a non-empty string")
+    if "id" in device:
+        errors.extend(validate_device_id(device["id"]))
     if "label" in device:
         errors.extend(validate_label(device["label"]))
     if "match" in device:
@@ -1295,14 +1316,19 @@ def extract_identity(metadata: Mapping[str, Any]) -> DeviceIdentity:
     """
     Read the camera identification of a file.
 
+    Without make nor model, an encoder tag naming a camera
+    (``ENCODER_MODEL_PREFIXES``, e.g. ``"DJI OsmoAction5 Pro"``) is used as model.
+
     :param metadata: Tags returned by ExifTool for the file.
     :return: Make, model and serial number (empty when absent).
     """
-    return DeviceIdentity(
-        clean_text(metadata.get("Make")),
-        clean_text(metadata.get("Model")),
-        clean_text(metadata.get("SerialNumber")),
-    )
+    make = clean_text(metadata.get("Make"))
+    model = clean_text(metadata.get("Model"))
+    if not make and not model:
+        encoder = clean_text(metadata.get(ENCODER_TAG))
+        if encoder.startswith(ENCODER_MODEL_PREFIXES):
+            model = encoder
+    return DeviceIdentity(make, model, clean_text(metadata.get("SerialNumber")))
 
 
 def extract_software(metadata: Mapping[str, Any]) -> str:
@@ -1374,8 +1400,8 @@ def analyze_file(
     """
     Decide the capture date and device of one file.
 
-    GoPro auxiliary files (``.LRV``, ``.THM``, and ``.WAV`` named with a GoPro
-    file id) are only flagged: they take the date and device of their main
+    Auxiliary files (``.LRV``, ``.LRF``, ``.THM``, and ``.WAV`` named with a
+    GoPro or DJI file id) are only flagged: they take the date and device of their main
     video later. Files without readable metadata,
     without a valid capture date or without any make/model are skipped; the
     system date is never used.
@@ -1487,11 +1513,12 @@ def describe_device(device: Mapping[str, Any]) -> str:
     """
     Describe a device entry for the user: its id, completed by readable details.
 
-    The id stays the reference used in ``conf/devices.json`` and by ``--device``;
-    the label and the ``match`` criteria (make, model) tell which camera it is.
+    The id is the name used in file names, in ``conf/devices.json`` and by
+    ``--device``; the label (when set) and the ``match`` criteria (make, model)
+    tell which camera it is.
 
     :param device: Device entry.
-    :return: Text such as ``'hero9-black' (label 'HERO9 Black'; Make 'GoPro', Model 'HERO9 Black')``.
+    :return: Text such as ``'GoPro9' (label 'My GoPro'; Make 'GoPro', Model 'HERO9 Black')``.
     """
     match = device.get("match") or {}
     identity = DeviceIdentity(
@@ -1499,10 +1526,12 @@ def describe_device(device: Mapping[str, Any]) -> str:
         clean_text(match.get("model")),
         clean_text(match.get("serial_number")),
     )
-    details = ["label '{}'".format(clean_text(device.get("label")))]
+    label = clean_text(device.get("label"))
+    details = ["label '{}'".format(label)] if label else []
     if any(identity):
         details.append(describe_identity(identity))
-    return "'{}' ({})".format(clean_text(device.get("id")), "; ".join(details))
+    shown = "'{}'".format(clean_text(device.get("id")))
+    return "{} ({})".format(shown, "; ".join(details)) if details else shown
 
 
 def format_unknown_forced_device_error(device_id: str, devices: Sequence[Mapping[str, Any]]) -> str:
@@ -1524,46 +1553,63 @@ def format_unknown_forced_device_error(device_id: str, devices: Sequence[Mapping
     return "\n".join(lines)
 
 
-def make_device_id(label: str, devices: Iterable[Mapping[str, Any]]) -> str:
+def is_device_id_taken(device_id: str, devices: Iterable[Mapping[str, Any]]) -> bool:
     """
-    Build a unique device id from a label.
+    Tell whether a device id is already used, case-insensitively.
 
-    :param label: Device label chosen by the user.
+    :param device_id: Id to look for.
     :param devices: Existing device entries.
-    :return: Lower-case id made of letters, digits and dashes, suffixed with ``-2``, ``-3``... if taken.
+    :return: ``True`` when an existing device has this id.
     """
-    base = re.sub(r"[^a-z0-9]+", "-", label.casefold()).strip("-") or "device"
-    taken = {device["id"].strip().lower() for device in devices}
+    wanted = device_id.strip().lower()
+    return any(device["id"].strip().lower() == wanted for device in devices)
+
+
+def default_device_id(identity: DeviceIdentity, devices: Iterable[Mapping[str, Any]]) -> str:
+    """
+    Suggest a unique device id from an identification.
+
+    :param identity: Identification of the device.
+    :param devices: Existing device entries.
+    :return: Model (or make) without invalid file name characters nor leading or
+        trailing spaces and dots, so that it passes ``validate_device_id``
+        (``"Device"`` as last resort), suffixed with ``-2``, ``-3``... if taken.
+    """
+    devices = list(devices)
+    text = identity.model or identity.make
+    invalid = set(find_invalid_filename_chars(text))
+    cleaned = "".join(char for char in text if char not in invalid)
+    base = re.sub(r"^[\s.]+|[\s.]+$", "", cleaned) or "Device"
     candidate = base
     counter = 2
-    while candidate in taken:
+    while is_device_id_taken(candidate, devices):
         candidate = "{}-{}".format(base, counter)
         counter += 1
     return candidate
 
 
-def default_label(identity: DeviceIdentity) -> str:
+def validate_device_id_answer(answer: str, devices: Sequence[Mapping[str, Any]] = ()) -> Optional[str]:
     """
-    Suggest a device label from an identification.
+    Validate a device id typed by the user.
 
-    :param identity: Identification of the device.
-    :return: Model (or make) without invalid file name characters nor leading or
-        trailing spaces and dots, so that it passes ``validate_label``; ``"Device"`` as last resort.
+    :param answer: Typed id.
+    :param devices: Existing device entries; the id must not be one of theirs.
+    :return: An error message, or ``None`` when the id is valid (see ``validate_device_id``) and free.
     """
-    text = identity.model or identity.make
-    invalid = set(find_invalid_filename_chars(text))
-    cleaned = "".join(char for char in text if char not in invalid)
-    return re.sub(r"^[\s.]+|[\s.]+$", "", cleaned) or "Device"
+    errors = validate_device_id(answer)
+    if not errors and is_device_id_taken(answer, devices):
+        errors.append("id {!r} is already used by another device".format(answer))
+    return "; ".join(errors) or None
 
 
 def validate_label_answer(answer: str) -> Optional[str]:
     """
-    Validate a device label typed by the user.
+    Accept any device label typed by the user, including an empty one.
 
     :param answer: Typed label.
-    :return: An error message, or ``None`` when the label is valid (see ``validate_label``).
+    :return: Always ``None``: the label is a free description.
     """
-    return "; ".join(validate_label(answer)) or None
+    return None
 
 
 def validate_offset_answer(answer: str) -> Optional[str]:
@@ -1640,7 +1686,7 @@ def prompt_new_device(
     so files of the same model without a serial number still match.
 
     :param identity: Identification of the unknown device.
-    :param devices: Existing device entries, used to build a unique id.
+    :param devices: Existing device entries; the new id must differ from theirs.
     :param input_func: Function reading one line, such as ``input``.
     :param out: Stream for messages.
     :param context: Lines describing the device's files, shown before the questions.
@@ -1650,9 +1696,10 @@ def prompt_new_device(
     print("\nUnknown device: {}".format(describe_identity(identity)), file=out)
     for line in context:
         print("  {}".format(line), file=out)
-    suggestion = default_label(identity)
-    label = ask(input_func, out, "  Label used in file names [{}]: ".format(suggestion),
-                validate_label_answer, suggestion)
+    suggestion = default_device_id(identity, devices)
+    device_id = ask(input_func, out, "  Device id used in file names [{}]: ".format(suggestion),
+                    functools.partial(validate_device_id_answer, devices=devices), suggestion)
+    label = ask(input_func, out, "  Label, a description for you (optional) []: ", validate_label_answer)
     offset = ask(input_func, out, "  Clock offset to apply, signed HH:MM:SS [{}]: ".format(DEFAULT_OFFSET),
                  validate_offset_answer, DEFAULT_OFFSET)
     zone = ask(input_func, out, "  IANA time zone, e.g. Europe/Paris (empty for none) []: ",
@@ -1669,7 +1716,11 @@ def prompt_new_device(
         match["model"] = identity.model
     if use_serial:
         match["serial_number"] = identity.serial_number
-    device = {"id": make_device_id(label, devices), "label": label, "match": match, "offset": offset}
+    device = {"id": device_id}  # type: Dict[str, Any]
+    if label:
+        device["label"] = label
+    device["match"] = match
+    device["offset"] = offset
     if zone:
         device["timezone"] = zone
     return device
@@ -1784,7 +1835,7 @@ def analyze_source(
     Discover the files of a source folder, read their metadata, identify their devices
     and compute their effective dates.
 
-    Source files are only read. GoPro auxiliary files are not sent to
+    Source files are only read. Auxiliary files are not sent to
     ExifTool: they take the date and device of their main video. Unknown
     devices are resolved before returning.
 
@@ -1854,7 +1905,7 @@ def print_analysis(analyses: Sequence[FileAnalysis], out: TextIO) -> None:
             else:
                 shown = analysis.date.isoformat(sep=" ") if analysis.date else "?"
             print("[OK]   {}  {}  device '{}'  ({})".format(
-                name, shown, device.get("label", "?"), describe_date_source(analysis)), file=out)
+                name, shown, device.get("id", "?"), describe_date_source(analysis)), file=out)
             for warning in analysis.effective.warnings if analysis.effective else ():
                 print("       warning: {}".format(warning), file=out)
                 warnings += 1
@@ -1922,13 +1973,13 @@ def sanitize_stem(stem: str) -> str:
     return cleaned
 
 
-def render_stem(pattern: str, date: datetime, label: str, original: str) -> str:
+def render_stem(pattern: str, date: datetime, device_id: str, original: str) -> str:
     """
     Render the file name pattern, without extension.
 
     :param pattern: Validated ``filename_pattern``, e.g. ``"{YYYY}-{MM}-{DD}_{DEVICE}"``.
     :param date: Effective date (its time zone information is ignored).
-    :param label: Device label, used for ``{DEVICE}``.
+    :param device_id: Device id, used for ``{DEVICE}``.
     :param original: Original file name without extension, used for ``{ORIGINAL}``.
     :return: Sanitized name, without extension.
     :raises ValueError: If the pattern contains an unknown token.
@@ -1940,7 +1991,7 @@ def render_stem(pattern: str, date: datetime, label: str, original: str) -> str:
         "HH": "{:02d}".format(date.hour),
         "MIN": "{:02d}".format(date.minute),
         "SEC": "{:02d}".format(date.second),
-        "DEVICE": label,
+        "DEVICE": device_id,
         "ORIGINAL": original,
     }
 
@@ -1972,7 +2023,7 @@ def build_target_stem(analysis: FileAnalysis, pattern: str) -> str:
     date = analysis.effective.value if analysis.effective is not None else analysis.date
     if date is None or analysis.device is None:
         raise ValueError("{}: no date or device to build a name".format(analysis.relative.as_posix()))
-    return render_stem(pattern, date, analysis.device["label"], analysis.relative.stem)
+    return render_stem(pattern, date, analysis.device["id"], analysis.relative.stem)
 
 
 def folder_key(relative: Path) -> str:
@@ -1989,26 +2040,27 @@ def folder_key(relative: Path) -> str:
     return relative.parent.as_posix()
 
 
-def gopro_file_id(stem: str) -> Optional[str]:
+def camera_file_id(stem: str) -> Optional[str]:
     """
-    Extract the GoPro file id ending a base name.
+    Extract the GoPro or DJI file id ending a base name.
 
     The id may follow a prefix added by another tool, separated by a
     non-alphanumeric character (e.g. ``2025-07-14_19-19-24_GH011892``).
 
     :param stem: File name without extension.
-    :return: Case-folded id such as ``gh011892``, or ``None`` when absent.
+    :return: Case-folded id such as ``gh011892`` or ``dji_20260307110012_0426_d``,
+        or ``None`` when absent.
     """
-    match = GOPRO_FILE_ID_RE.search(stem.casefold())
+    match = CAMERA_FILE_ID_RE.search(stem.casefold())
     return match.group(1) if match else None
 
 
 def is_auxiliary_file(relative: Path) -> bool:
     """
-    Tell whether a file is a GoPro auxiliary file following a main video.
+    Tell whether a file is an auxiliary file following a main video.
 
-    ``.LRV`` and ``.THM`` files always are; ``.WAV`` files only when their name
-    ends with a GoPro file id (GoPro "RAW audio").
+    ``.LRV``, ``.LRF`` and ``.THM`` files always are; ``.WAV`` files only when
+    their name ends with a GoPro or DJI file id (separate camera audio).
 
     :param relative: File path relative to the source folder.
     :return: ``True`` for an auxiliary file.
@@ -2016,12 +2068,12 @@ def is_auxiliary_file(relative: Path) -> bool:
     suffix = relative.suffix.lower()
     if suffix in AUXILIARY_EXTENSIONS:
         return True
-    return suffix in GOPRO_AUDIO_EXTENSIONS and gopro_file_id(relative.stem) is not None
+    return suffix in CAMERA_AUDIO_EXTENSIONS and camera_file_id(relative.stem) is not None
 
 
 def main_video_stems(auxiliary_stem: str) -> List[str]:
     """
-    List the base names a GoPro auxiliary file may share with its main video.
+    List the base names an auxiliary file may share with its main video.
 
     The same base name comes first; a HERO6+ low-resolution video ``GL<n>``
     also follows ``GH<n>`` then ``GX<n>``.
@@ -2040,12 +2092,12 @@ def group_auxiliaries(
     analyses: Sequence[FileAnalysis],
 ) -> Tuple[Dict[Path, List[FileAnalysis]], Dict[Path, str]]:
     """
-    Link GoPro auxiliary files (``.LRV``, ``.THM``, ``.WAV``) to their main video.
+    Link auxiliary files (``.LRV``, ``.LRF``, ``.THM``, ``.WAV``) to their main video.
 
     The main video must be in the same folder, have a ``MAIN_VIDEO_EXTENSIONS``
     extension, share the base name (see ``main_video_stems``) and be ready to
-    rename. When no base name matches, the GoPro file ids ending both names
-    are compared the same way (see ``gopro_file_id``), so files whose names
+    rename. When no base name matches, the camera file ids ending both names
+    are compared the same way (see ``camera_file_id``), so files whose names
     were prefixed differently by another tool are still linked. A main video
     takes at most one auxiliary file per extension.
 
@@ -2060,7 +2112,7 @@ def group_auxiliaries(
         if analysis.status != STATUS_AUXILIARY and analysis.relative.suffix.lower() in MAIN_VIDEO_EXTENSIONS:
             folder = folder_key(analysis.relative)
             mains.setdefault((folder, analysis.relative.stem.casefold()), analysis)
-            main_id = gopro_file_id(analysis.relative.stem)
+            main_id = camera_file_id(analysis.relative.stem)
             if main_id is not None:
                 mains_by_id.setdefault((folder, main_id), analysis)
     auxiliaries = {}  # type: Dict[Path, List[FileAnalysis]]
@@ -2071,7 +2123,7 @@ def group_auxiliaries(
         relative = analysis.relative
         folder = folder_key(relative)
         lookups = [(mains, stem) for stem in main_video_stems(relative.stem)]
-        auxiliary_id = gopro_file_id(relative.stem)
+        auxiliary_id = camera_file_id(relative.stem)
         if auxiliary_id is not None:
             lookups.extend((mains_by_id, file_id) for file_id in main_video_stems(auxiliary_id))
         main = None
@@ -2153,7 +2205,7 @@ def build_plan(
     place) or under ``dest_root`` (copy). Collisions are resolved per target
     folder against the planned names and the files already present there;
     existing files are never targeted, except a file keeping its own name in
-    place. GoPro auxiliary files take the final name of their main video with
+    place. Auxiliary files take the final name of their main video with
     their own extension. Files are only listed, never modified.
 
     :param analyses: File analyses, with every device resolved and effective dates computed.

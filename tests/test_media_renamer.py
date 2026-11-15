@@ -80,8 +80,8 @@ def make_device(**overrides: Any) -> Dict[str, Any]:
     :return: Device entry.
     """
     device = {
-        "id": "gopro9",
-        "label": "GoPro9",
+        "id": "GoPro9",
+        "label": "My GoPro",
         "match": {"make": "GoPro", "model": "HERO9 Black", "serial_number": ""},
         "offset": "-01:00:00",
     }
@@ -292,21 +292,30 @@ def test_find_invalid_filename_chars() -> None:
     assert mr.find_invalid_filename_chars("été 📷 (1)") == []
 
 
+def test_validate_device_id() -> None:
+    """
+    Check that a device id must be portable: no forbidden character, no leading or trailing space or dot.
+    """
+    assert mr.validate_device_id("GoPro 9") == []
+    assert mr.validate_device_id("Été (Sony)") == []
+    assert mr.validate_device_id("v1.2") == []
+    assert mr.validate_device_id("") == ["'id' must be a non-empty string"]
+    assert mr.validate_device_id("   ") == ["'id' must be a non-empty string"]
+    assert mr.validate_device_id(3) == ["'id' must be a non-empty string"]
+    assert mr.validate_device_id("a:b") == ["'id' contains invalid file name characters: ':'"]
+    assert mr.validate_device_id("a\x7fb") == ["'id' contains invalid file name characters: '\\x7f'"]
+    assert mr.validate_device_id("GoPro ") == ["'id' must not start or end with a space"]
+    assert mr.validate_device_id(".GoPro") == ["'id' must not start or end with '.'"]
+    assert len(mr.validate_device_id(" a?.")) == 3
+
+
 def test_validate_label() -> None:
     """
-    Check that a label must be portable: no forbidden character, no leading or trailing space or dot.
+    Check that a label is free text, possibly empty, but must be a string.
     """
-    assert mr.validate_label("GoPro 9") == []
-    assert mr.validate_label("Été (Sony)") == []
-    assert mr.validate_label("v1.2") == []
-    assert mr.validate_label("") == ["'label' must be a non-empty string"]
-    assert mr.validate_label("   ") == ["'label' must be a non-empty string"]
-    assert mr.validate_label(3) == ["'label' must be a non-empty string"]
-    assert mr.validate_label("a:b") == ["'label' contains invalid file name characters: ':'"]
-    assert mr.validate_label("a\x7fb") == ["'label' contains invalid file name characters: '\\x7f'"]
-    assert mr.validate_label("GoPro ") == ["'label' must not start or end with a space"]
-    assert mr.validate_label(".GoPro") == ["'label' must not start or end with '.'"]
-    assert len(mr.validate_label(" a?.")) == 3
+    assert mr.validate_label("Old phone: the grey one / 2012.") == []
+    assert mr.validate_label("") == []
+    assert mr.validate_label(3) == ["'label' must be a string"]
 
 
 # --- validate_filename_pattern ------------------------------------------------
@@ -611,6 +620,10 @@ def test_validate_device_valid() -> None:
     """
     assert mr.validate_device(make_device()) == []
     assert mr.validate_device(make_device(timezone="Europe/Paris"), set()) == []
+    without_label = make_device()
+    del without_label["label"]
+    assert mr.validate_device(without_label) == []
+    assert mr.validate_device(make_device(label="")) == []
 
 
 @pytest.mark.parametrize(
@@ -618,10 +631,10 @@ def test_validate_device_valid() -> None:
     [
         ({"offset": "-1:00"}, "invalid offset"),
         ({"id": ""}, "'id' must be a non-empty string"),
-        ({"label": ""}, "'label' must be a non-empty string"),
-        ({"label": "Go/Pro"}, "invalid file name characters"),
-        ({"label": " GoPro"}, "must not start or end with a space"),
-        ({"label": "GoPro."}, "must not start or end with '.'"),
+        ({"id": "Go/Pro"}, "invalid file name characters"),
+        ({"id": " GoPro"}, "must not start or end with a space"),
+        ({"id": "GoPro."}, "must not start or end with '.'"),
+        ({"label": None}, "'label' must be a string"),
         ({"match": {}}, "non-empty 'make' or 'model'"),
         ({"timezone": "Not a zone"}, "invalid time zone"),
         ({"color": "red"}, "unknown field 'color'"),
@@ -672,7 +685,7 @@ def test_validate_devices_prefixes_entry_errors() -> None:
     Check that entry errors name the faulty device.
     """
     errors = mr.validate_devices({"devices": [make_device(offset="bad")]})
-    assert errors[0].startswith("device #1 ('gopro9'): invalid offset")
+    assert errors[0].startswith("device #1 ('GoPro9'): invalid offset")
 
 
 @pytest.mark.parametrize("data", [[], {}, {"devices": {}}])
@@ -766,7 +779,7 @@ def test_write_devices_file_without_backup_keeps_previous_backup(tmp_path: Path)
     mr.write_devices_file(path, {"devices": [make_device()]})
     mr.write_devices_file(path, {"devices": [make_device(), make_device(id="other")]}, backup=False)
     assert (tmp_path / "devices.json.bak").read_text(encoding="utf-8") == original
-    assert [device["id"] for device in mr.load_devices(path)] == ["gopro9", "other"]
+    assert [device["id"] for device in mr.load_devices(path)] == ["GoPro9", "other"]
 
 
 def test_validate_devices_scans_time_zones_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1270,7 +1283,7 @@ def test_build_exiftool_command() -> None:
     command = mr.build_exiftool_command(Path("exiftool"), Path("list.args"))
     assert command[0] == "exiftool" and "-json" in command
     assert command[-2:] == ["-@", "list.args"]
-    assert "-DateTimeOriginal" in command and "-SerialNumber" in command
+    assert "-DateTimeOriginal" in command and "-SerialNumber" in command and "-Encoder" in command
     assert not any("GPS" in part for part in command)
 
 
@@ -1795,6 +1808,27 @@ def test_extract_identity() -> None:
     assert mr.extract_identity({}) == mr.DeviceIdentity("", "", "")
 
 
+def test_extract_identity_uses_camera_encoder_as_model() -> None:
+    """
+    Check that a camera encoder tag stands for the model only without make nor model.
+    """
+    dji = {"Encoder": " DJI OsmoAction5 Pro "}
+    assert mr.extract_identity(dji) == mr.DeviceIdentity("", "DJI OsmoAction5 Pro", "")
+    assert mr.extract_identity({"Encoder": "Lavf58.76.100"}) == mr.DeviceIdentity("", "", "")
+    assert mr.extract_identity({"Encoder": "DJI X", "Model": "HERO9 Black"}).model == "HERO9 Black"
+    assert mr.extract_identity({"Encoder": "DJI X", "Make": "DJI"}) == mr.DeviceIdentity("DJI", "", "")
+
+
+def test_analyze_file_identifies_dji_video_by_encoder() -> None:
+    """
+    Check that a DJI video without Make/Model is matched through its encoder tag.
+    """
+    device = make_device(id="Osmo5", match={"model": "DJI OsmoAction5 Pro"})
+    metadata = {"CreateDate": "2026:03:07 10:00:13", "Encoder": "DJI OsmoAction5 Pro"}
+    analysis = mr.analyze_file(Path("DJI_20260307110012_0426_D.MP4"), metadata, None, [device])
+    assert analysis.status == mr.STATUS_READY and analysis.device is device
+
+
 def test_extract_software() -> None:
     """
     Check that the first non-empty software or firmware tag is read.
@@ -1873,7 +1907,7 @@ def test_analyze_file_statuses() -> None:
     undated = mr.analyze_file(Path("a.jpg"), {"Make": "GoPro"}, None, devices)
     assert undated.status == mr.STATUS_SKIPPED and "no valid capture date" in undated.message
     ready = mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, devices)
-    assert (ready.status, ready.device["id"], ready.date_tag) == (mr.STATUS_READY, "gopro9", "DateTimeOriginal")
+    assert (ready.status, ready.device["id"], ready.date_tag) == (mr.STATUS_READY, "GoPro9", "DateTimeOriginal")
     assert ready.date == datetime(2024, 1, 2, 3, 4, 5)
     assert mr.analyze_file(Path("a.jpg"), DATED_TAGS, None, [], forced).device["id"] == "forced"
     anonymous = mr.analyze_file(Path("a.mp4"), {"CreateDate": "2024:01:02 03:04:05"}, None, devices)
@@ -1946,6 +1980,8 @@ def test_describe_device() -> None:
     assert mr.describe_device(device) == (
         "'gopro-1' (label 'Ma GoPro'; Make 'GoPro', Model 'HERO9 Black', serial ***4391)")
     assert mr.describe_device({"id": "x", "label": "X", "match": {}}) == "'x' (label 'X')"
+    assert mr.describe_device({"id": "x", "label": "", "match": {"model": "M"}}) == "'x' (Model 'M')"
+    assert mr.describe_device({"id": "x", "match": {}}) == "'x'"
 
 
 def test_format_unknown_forced_device_error() -> None:
@@ -1964,36 +2000,44 @@ def test_format_unknown_forced_device_error() -> None:
     assert "No device is registered" in mr.format_unknown_forced_device_error("nope", [])
 
 
-def test_make_device_id() -> None:
+def test_is_device_id_taken() -> None:
     """
-    Check that ids are slugs, unique among existing devices.
+    Check that ids are compared case-insensitively, ignoring surrounding spaces.
     """
-    devices = [make_device(id="sony-tf1"), make_device(id="Sony-TF1-2")]
-    assert mr.make_device_id("GoPro 9", []) == "gopro-9"
-    assert mr.make_device_id("Sony TF1", devices) == "sony-tf1-3"
-    assert mr.make_device_id("***", []) == "device"
+    devices = [make_device(id="Sony-TF1")]
+    assert mr.is_device_id_taken("sony-tf1", devices)
+    assert mr.is_device_id_taken(" SONY-TF1 ", devices)
+    assert not mr.is_device_id_taken("sony", devices)
+    assert not mr.is_device_id_taken("x", [])
 
 
-def test_default_label() -> None:
+def test_default_device_id() -> None:
     """
-    Check that the suggested label comes from the model, then the make.
+    Check that the suggested id comes from the model, then the make, is portable and unique.
     """
-    assert mr.default_label(mr.DeviceIdentity("GoPro", "HERO9: Black", "")) == "HERO9 Black"
-    assert mr.default_label(mr.DeviceIdentity("NIKON", "", "")) == "NIKON"
-    assert mr.default_label(mr.DeviceIdentity("", "", "")) == "Device"
-    assert mr.default_label(mr.DeviceIdentity("", ". HERO9 Black. ", "")) == "HERO9 Black"
-    assert mr.default_label(mr.DeviceIdentity("", "...", "")) == "Device"
-    assert mr.validate_label(mr.default_label(mr.DeviceIdentity("", " .a:b. ", ""))) == []
+    assert mr.default_device_id(mr.DeviceIdentity("GoPro", "HERO9: Black", ""), []) == "HERO9 Black"
+    assert mr.default_device_id(mr.DeviceIdentity("NIKON", "", ""), []) == "NIKON"
+    assert mr.default_device_id(mr.DeviceIdentity("", "", ""), []) == "Device"
+    assert mr.default_device_id(mr.DeviceIdentity("", ". HERO9 Black. ", ""), []) == "HERO9 Black"
+    assert mr.default_device_id(mr.DeviceIdentity("", "...", ""), []) == "Device"
+    assert mr.validate_device_id(mr.default_device_id(mr.DeviceIdentity("", " .a:b. ", ""), [])) == []
+    devices = [make_device(id="dsc-tf1"), make_device(id="DSC-TF1-2")]
+    assert mr.default_device_id(mr.DeviceIdentity("SONY", "DSC-TF1", ""), devices) == "DSC-TF1-3"
 
 
 def test_answer_validators() -> None:
     """
     Check the validation of each interactive answer.
     """
-    assert mr.validate_label_answer("GoPro9") is None
-    assert "empty" in mr.validate_label_answer("")
-    assert "invalid" in mr.validate_label_answer("a/b")
-    assert "'.'" in mr.validate_label_answer("GoPro.")
+    devices = [make_device(id="GoPro9")]
+    assert mr.validate_device_id_answer("GoPro9") is None
+    assert mr.validate_device_id_answer("GoPro10", devices) is None
+    assert "already used" in mr.validate_device_id_answer("gopro9", devices)
+    assert "empty" in mr.validate_device_id_answer("")
+    assert "invalid" in mr.validate_device_id_answer("a/b")
+    assert "'.'" in mr.validate_device_id_answer("GoPro.")
+    assert mr.validate_label_answer("") is None
+    assert mr.validate_label_answer("Ma GoPro / la vieille") is None
     assert mr.validate_offset_answer("-01:00:00") is None
     assert "invalid offset" in mr.validate_offset_answer("1h")
     assert mr.validate_timezone_answer("") is None
@@ -2042,9 +2086,10 @@ def test_prompt_new_device_with_serial_and_timezone() -> None:
     """
     identity = mr.DeviceIdentity("GoPro", "HERO9 Black", "C3441326974391")
     out = io.StringIO()
-    device = mr.prompt_new_device(identity, [], scripted(["GoPro 9", "-01:00:00", "Europe/Paris", "y"]), out)
+    answers = ["GoPro9", "Ma GoPro", "-01:00:00", "Europe/Paris", "y"]
+    device = mr.prompt_new_device(identity, [], scripted(answers), out)
     assert device == {
-        "id": "gopro-9", "label": "GoPro 9", "offset": "-01:00:00", "timezone": "Europe/Paris",
+        "id": "GoPro9", "label": "Ma GoPro", "offset": "-01:00:00", "timezone": "Europe/Paris",
         "match": {"make": "GoPro", "model": "HERO9 Black", "serial_number": "C3441326974391"},
     }
     assert "C3441326974391" not in out.getvalue()
@@ -2053,12 +2098,22 @@ def test_prompt_new_device_with_serial_and_timezone() -> None:
 
 def test_prompt_new_device_defaults() -> None:
     """
-    Check the default label and offset, and that the serial number is not used by default.
+    Check the default id, empty label and offset, and that the serial number is not used by default.
     """
     identity = mr.DeviceIdentity("", "HERO9 Black", "S1")
-    device = mr.prompt_new_device(identity, [], scripted(["", "", "", ""]), io.StringIO())
-    assert device == {"id": "hero9-black", "label": "HERO9 Black", "offset": "+00:00:00",
-                      "match": {"model": "HERO9 Black"}}
+    device = mr.prompt_new_device(identity, [], scripted(["", "", "", "", ""]), io.StringIO())
+    assert device == {"id": "HERO9 Black", "offset": "+00:00:00", "match": {"model": "HERO9 Black"}}
+
+
+def test_prompt_new_device_rejects_taken_id() -> None:
+    """
+    Check that an id already used by another device is asked again.
+    """
+    out = io.StringIO()
+    answers = ["gopro9", "GoPro10", "", "", ""]
+    device = mr.prompt_new_device(mr.DeviceIdentity("GoPro", "HERO10", ""), [make_device()], scripted(answers), out)
+    assert device["id"] == "GoPro10" and "label" not in device
+    assert "already used" in out.getvalue()
 
 
 def test_prompt_new_device_shows_context() -> None:
@@ -2066,7 +2121,7 @@ def test_prompt_new_device_shows_context() -> None:
     Check that the context lines are shown under the device before the questions.
     """
     out = io.StringIO()
-    mr.prompt_new_device(mr.DeviceIdentity("SONY", "DSC-TF1", ""), [], scripted(["", "", ""]), out,
+    mr.prompt_new_device(mr.DeviceIdentity("SONY", "DSC-TF1", ""), [], scripted(["", "", "", ""]), out,
                          ["1 file(s), e.g. a.jpg", "Software: v1"])
     assert out.getvalue() == "\nUnknown device: Make 'SONY', Model 'DSC-TF1'\n  1 file(s), e.g. a.jpg\n  Software: v1\n"
 
@@ -2149,13 +2204,13 @@ def test_resolve_unknown_devices_asks_once_per_device(tmp_path: Path) -> None:
     out = io.StringIO()
     result, devices = mr.resolve_unknown_devices(analyses, mr.load_devices(path), path, True, read, out)
     assert all(analysis.status == mr.STATUS_READY for analysis in result)
-    assert [analysis.device["id"] for analysis in result] == ["hero9-black"] * 3 + ["e4500"]
-    assert sum("Label" in prompt for prompt in prompts) == 2
-    assert [device["id"] for device in mr.load_devices(path)] == ["other", "hero9-black", "e4500"]
+    assert [analysis.device["id"] for analysis in result] == ["HERO9 Black"] * 3 + ["E4500"]
+    assert sum("Device id" in prompt for prompt in prompts) == 2
+    assert [device["id"] for device in mr.load_devices(path)] == ["other", "HERO9 Black", "E4500"]
     # The backup keeps the file as it was before the run, not after the first new device.
     assert [device["id"] for device in mr.load_devices(tmp_path / "devices.json.bak")] == ["other"]
     assert devices == mr.load_devices(path)
-    assert "Saved device 'hero9-black' (label 'HERO9 Black'; Model 'HERO9 Black') to" in out.getvalue()
+    assert "Saved device 'HERO9 Black' (Model 'HERO9 Black') to" in out.getvalue()
     assert "  1 file(s), taken 2024-01-02, e.g. v.mp4\n" in out.getvalue()
     assert "  1 file(s), taken 2024-01-02, e.g. n.jpg\n" in out.getvalue()
 
@@ -2321,24 +2376,24 @@ BASE = "2024-01-02_03-04-05_GoPro9"
 WHEN = datetime(2024, 1, 2, 3, 4, 5)
 
 
-def ready(name: str, when: datetime = WHEN, label: str = "GoPro9", warnings: Any = ()) -> mr.FileAnalysis:
+def ready(name: str, when: datetime = WHEN, device_id: str = "GoPro9", warnings: Any = ()) -> mr.FileAnalysis:
     """
     Build the analysis of a ready file with an effective date.
 
     :param name: Relative path of the file.
     :param when: Effective date.
-    :param label: Device label.
+    :param device_id: Device id, used in file names.
     :param warnings: Warnings of the effective date.
     :return: File analysis.
     """
     return mr.FileAnalysis(Path(name), mr.STATUS_READY, "", "DateTimeOriginal", when,
-                           mr.DeviceIdentity("GoPro", "HERO9 Black", ""), make_device(label=label),
+                           mr.DeviceIdentity("GoPro", "HERO9 Black", ""), make_device(id=device_id),
                            mr.EffectiveDate(when, "", "", tuple(warnings)))
 
 
 def auxiliary(name: str) -> mr.FileAnalysis:
     """
-    Build the analysis of a GoPro auxiliary file.
+    Build the analysis of an auxiliary file.
 
     :param name: Relative path of the file.
     :return: File analysis.
@@ -2450,25 +2505,32 @@ def test_build_plan_lists_existing_names_per_folder_case(tmp_path: Path) -> None
     assert targets(plan)["a/y.jpg"] == "a/" + BASE + "_01.jpg"
 
 
-def test_gopro_file_id() -> None:
+def test_camera_file_id() -> None:
     """
-    Check the GoPro file id at the end of a base name, with or without prefix.
+    Check the GoPro or DJI file id at the end of a base name, with or without prefix.
     """
-    assert mr.gopro_file_id("GH011892") == "gh011892"
-    assert mr.gopro_file_id("2025-07-14_19-19-24_2025-07-14_13-19-24_GL011892") == "gl011892"
-    assert mr.gopro_file_id("trip GOPR2098") == "gopr2098"
-    assert mr.gopro_file_id("GP010123") == "gp010123"
-    assert mr.gopro_file_id("XGH011892") is None
-    assert mr.gopro_file_id("GH011892_01") is None
-    assert mr.gopro_file_id("GH01189") is None
-    assert mr.gopro_file_id("holiday") is None
+    assert mr.camera_file_id("GH011892") == "gh011892"
+    assert mr.camera_file_id("2025-07-14_19-19-24_2025-07-14_13-19-24_GL011892") == "gl011892"
+    assert mr.camera_file_id("trip GOPR2098") == "gopr2098"
+    assert mr.camera_file_id("GP010123") == "gp010123"
+    assert mr.camera_file_id("XGH011892") is None
+    assert mr.camera_file_id("GH011892_01") is None
+    assert mr.camera_file_id("GH01189") is None
+    assert mr.camera_file_id("holiday") is None
+    assert mr.camera_file_id("DJI_20260307110012_0426_D") == "dji_20260307110012_0426_d"
+    assert mr.camera_file_id("2026-03-07_10-00-13_DJI_20260307110012_0426_D") == "dji_20260307110012_0426_d"
+    assert mr.camera_file_id("XDJI_20260307110012_0426_D") is None
+    assert mr.camera_file_id("DJI_20260307110012_0426") is None
+    assert mr.camera_file_id("DJI_0426") is None
 
 
 def test_is_auxiliary_file() -> None:
     """
-    Check that .LRV/.THM always follow a video and .WAV only with a GoPro file id.
+    Check that .LRV/.LRF/.THM always follow a video and .WAV only with a camera file id.
     """
     assert mr.is_auxiliary_file(Path("a.LRV"))
+    assert mr.is_auxiliary_file(Path("DJI_20260307110012_0426_D.LRF"))
+    assert mr.is_auxiliary_file(Path("DJI_20260307110012_0426_D.WAV"))
     assert mr.is_auxiliary_file(Path("sub/a.thm"))
     assert mr.is_auxiliary_file(Path("prefix_GH011905.WAV"))
     assert not mr.is_auxiliary_file(Path("interview.wav"))
@@ -2518,6 +2580,20 @@ def test_group_auxiliaries_by_gopro_file_id() -> None:
                                              "2025-07-14_19-19-24_GL011892.lrv",
                                              "2025-07-15_18-25-20_GH011892.wav"]}
     assert set(orphans) == {Path("2025-07-14_23-29-07_GL011898.lrv"), Path("sub/x_GH011892.thm")}
+
+
+def test_group_auxiliaries_dji_files() -> None:
+    """
+    Check that DJI audio and proxy files follow their video, by name or by DJI file id.
+    """
+    analyses = [
+        ready("DJI_20260307110012_0426_D.MP4"), auxiliary("DJI_20260307110012_0426_D.WAV"),
+        auxiliary("x_DJI_20260307110012_0426_D.LRF"), auxiliary("DJI_20260307110500_0427_D.WAV"),
+    ]
+    groups, orphans = mr.group_auxiliaries(analyses)
+    assert {main.as_posix(): [aux.relative.name for aux in auxes] for main, auxes in groups.items()} == {
+        "DJI_20260307110012_0426_D.MP4": ["DJI_20260307110012_0426_D.WAV", "x_DJI_20260307110012_0426_D.LRF"]}
+    assert set(orphans) == {Path("DJI_20260307110500_0427_D.WAV")}
 
 
 def test_group_auxiliaries_same_name_wins_over_file_id() -> None:
@@ -2589,7 +2665,7 @@ def test_build_plan_collisions_inside_batch(tmp_path: Path) -> None:
     :param tmp_path: Pytest temporary folder.
     """
     analyses = [ready("a.jpg"), ready("b.jpg"), ready("c.JPG"), ready("d.png"),
-                ready("e.jpg", label="gopro9")]
+                ready("e.jpg", device_id="gopro9")]
     assert targets(mr.build_plan(analyses, PATTERN, tmp_path)) == {
         "a.jpg": BASE + ".jpg", "b.jpg": BASE + "_01.jpg", "c.JPG": BASE + "_02.JPG", "d.png": BASE + ".png",
         "e.jpg": "2024-01-02_03-04-05_gopro9_03.jpg"}
@@ -3300,7 +3376,7 @@ def test_load_devices_quietly(tmp_path: Path) -> None:
     :param tmp_path: Pytest temporary folder.
     """
     path = write_json(tmp_path / "devices.json", {"devices": [make_device()]})
-    assert [device["id"] for device in mr.load_devices_quietly(path)] == ["gopro9"]
+    assert [device["id"] for device in mr.load_devices_quietly(path)] == ["GoPro9"]
     path.write_text("{", encoding="utf-8")
     assert mr.load_devices_quietly(path) == []
 
@@ -3424,17 +3500,17 @@ def test_analyze_source_real_samples(real_samples: Path, real_exiftool: Path, tm
     devices_path = write_json(tmp_path / "devices.json", {"devices": []})
     before = snapshot(real_samples)
     # The MP4 (no serial number) is met first, so no serial question is asked.
-    answers = ["GoPro9", "-01:00:00", "", "EOS6D", "", ""]
+    answers = ["GoPro9", "", "-01:00:00", "", "EOS6D", "", "", ""]
     analyses = mr.analyze_source(real_samples, [".jpg", ".mp4", ".dng"], [], devices_path, real_exiftool,
                                  recursive=True, interactive=True, input_func=scripted(answers),
                                  out=io.StringIO())
     by_name = {analysis.relative.as_posix(): analysis for analysis in analyses}
-    assert by_name["GH010001.MP4"].device["label"] == "GoPro9"
-    assert by_name["été/GOPR0001.JPG"].device["label"] == "GoPro9"
-    assert by_name["raw/IMG_0001.DNG"].device["label"] == "EOS6D"
+    assert by_name["GH010001.MP4"].device["id"] == "GoPro9"
+    assert by_name["été/GOPR0001.JPG"].device["id"] == "GoPro9"
+    assert by_name["raw/IMG_0001.DNG"].device["id"] == "EOS6D"
     assert by_name["undated.jpg"].status == mr.STATUS_SKIPPED
     assert by_name["corrupt.jpg"].status == mr.STATUS_SKIPPED
-    assert [device["label"] for device in mr.load_devices(devices_path)] == ["GoPro9", "EOS6D"]
+    assert [device["id"] for device in mr.load_devices(devices_path)] == ["GoPro9", "EOS6D"]
     again = mr.analyze_source(real_samples, [".jpg", ".mp4", ".dng"], mr.load_devices(devices_path),
                               devices_path, real_exiftool, recursive=True, interactive=False)
     assert [analysis.status for analysis in again] == [analysis.status for analysis in analyses]
@@ -3555,7 +3631,7 @@ def test_main_analysis_prompts_once_and_saves(analyzed_project: Path, capsys: py
     :param analyzed_project: Project with a ``src`` folder of two photos and faked metadata.
     :param capsys: Pytest fixture capturing the standard output and error streams.
     """
-    answers = iter(["GoPro9", "-01:00:00", ""])
+    answers = iter(["GoPro9", "", "-01:00:00", ""])
     code = mr.main(["--source", str(analyzed_project / "src")], project_root=analyzed_project,
                    interactive=True, input_func=lambda prompt: next(answers))
     assert code == 0
@@ -3564,7 +3640,7 @@ def test_main_analysis_prompts_once_and_saves(analyzed_project: Path, capsys: py
     assert "[RENAME] a.jpg -> 2024-01-02_02-04-05_GoPro9.jpg" in out
     assert "[RENAME] b.jpg -> 2024-01-02_02-04-05_GoPro9_01.jpg" in out
     devices = mr.load_devices(analyzed_project / "conf" / "devices.json")
-    assert [device["id"] for device in devices] == ["gopro9"]
+    assert [device["id"] for device in devices] == ["GoPro9"]
 
 
 def test_main_analysis_new_device_tz_without_database(
@@ -3578,7 +3654,7 @@ def test_main_analysis_new_device_tz_without_database(
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     simulate_missing_timezone_database(monkeypatch)
-    answers = iter(["GoPro9", "-01:00:00", "Europe/Paris"])
+    answers = iter(["GoPro9", "", "-01:00:00", "Europe/Paris"])
     code = mr.main(["--source", str(analyzed_project / "src")], project_root=analyzed_project,
                    interactive=True, input_func=lambda prompt: next(answers))
     assert code == 0
@@ -3746,7 +3822,7 @@ def test_main_apply_resolves_unknown_devices_first(
     argv = ["--source", str(source), "--apply"]
     assert mr.main(argv, project_root=analyzed_project, interactive=False) == 1
     assert snapshot(source) == before
-    answers = iter(["GoPro9", "", ""])
+    answers = iter(["GoPro9", "", "", ""])
 
     def answer(prompt: str) -> str:
         """
@@ -4172,7 +4248,7 @@ def test_corrupt_files_are_skipped_and_run_completes(corrupt_samples: Path, real
         ("config.json", b'{"filename_pattern": 5}', "filename_pattern"),
         ("devices.json", b"null", "devices.json"),
         ("devices.json", b'{"devices": null}', "devices"),
-        ("devices.json", b'{"devices": [{"id": "x"}]}', "label"),
+        ("devices.json", b'{"devices": [{"id": "x"}]}', "match"),
         ("devices.json", b'{"devices": [{"id": "x", "label": "X", "match": {}, "offset": "1:00"}]}', "offset"),
     ],
 )
@@ -4504,7 +4580,7 @@ def test_apply_special_characters(tmp_path: Path, copy: bool) -> None:
                  folder + "semi;colon,comma=equal+plus.jpg"]
     make_tree(source, originals)
     label = "Caméra \U0001f4f7"
-    analyses = [ready(name, when=WHEN + timedelta(seconds=index), label=label)
+    analyses = [ready(name, when=WHEN + timedelta(seconds=index), device_id=label)
                 for index, name in enumerate(originals)]
     dest = tmp_path / "dest" if copy else None
     plan = mr.build_plan(analyses, "{DEVICE} {ORIGINAL}", source, dest)

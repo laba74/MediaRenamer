@@ -40,7 +40,7 @@ Goal: read metadata through ExifTool and match each file to a device.
 - **2.2 ExifTool wrapper** — Run ExifTool via `subprocess` (JSON output), batch calls, handle errors and timeouts.
 - **2.3 Date source selection** — Choose and document the EXIF date tag priority (e.g. `DateTimeOriginal`, `CreateDate`, `MediaCreateDate`); report files with missing/unreadable date and skip them (never use the system date).
 - **2.4 Device matching** — Case-insensitive match on `Make`, `Model`, optional `SerialNumber` (empty serial is not a criterion); first matching entry wins; `--device` forces the device.
-- **2.5 Unknown device handling** — Interactive prompt for label and offset, saved to `conf/devices.json`, reused for all matching files of the batch; resolved before any file modification; clear error in non-interactive mode.
+- **2.5 Unknown device handling** — Interactive prompt for id (used in file names), optional label and offset, saved to `conf/devices.json`, reused for all matching files of the batch; resolved before any file modification; clear error in non-interactive mode.
 
 ### Done — Epic 2
 - [x] On a sample folder, discovery returns the expected files (flat and recursive, nested subfolders, relative paths preserved).
@@ -82,6 +82,8 @@ Goal: build the target names once, shared by preview and apply.
 - [x] Tests: collisions inside the batch, with existing files, case-only differences.
 - [x] Tests: `.LRV`/`.THM` follow the main video; orphan auxiliary is warned and not renamed.
 - [x] Tests: auxiliary files and GoPro `.WAV` follow their main video by GoPro file id when prefixes differ.
+- [x] Tests: DJI `.WAV` (separate audio) and `.LRF` (proxy) follow their main video by name or DJI file id (`DJI_<date>_<n>_<x>`).
+- [x] Tests: a DJI video without `Make`/`Model` is identified by its `Encoder` tag.
 - [x] Tests: same base name in two different subfolders yields no cross-folder pairing and no cross-folder collision suffix.
 - [x] Plan generation touches no file.
 

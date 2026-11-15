@@ -38,10 +38,10 @@ exiftool -ver
 
 ## Inspect a file's tags
 
-MediaRenamer reads only these tags: `DateTimeOriginal`, `CreateDate`, `MediaCreateDate`, `TrackCreateDate` (dates, in this priority), `OffsetTimeOriginal`, `OffsetTimeDigitized` (UTC offsets), `Make`, `Model`, `SerialNumber` (device identification), and `Software`, `FirmwareVersion` (only shown to help recognize an unknown device, never used for matching). To see what ExifTool returns for one file:
+MediaRenamer reads only these tags: `DateTimeOriginal`, `CreateDate`, `MediaCreateDate`, `TrackCreateDate` (dates, in this priority), `OffsetTimeOriginal`, `OffsetTimeDigitized` (UTC offsets), `Make`, `Model`, `SerialNumber`, `Encoder` (device identification; `Encoder` only stands for a missing model when it names a camera, e.g. DJI), and `Software`, `FirmwareVersion` (only shown to help recognize an unknown device, never used for matching). To see what ExifTool returns for one file:
 
 ```sh
-exiftool -s -DateTimeOriginal -CreateDate -MediaCreateDate -TrackCreateDate -OffsetTimeOriginal -OffsetTimeDigitized -Make -Model -SerialNumber -Software -FirmwareVersion FILE
+exiftool -s -DateTimeOriginal -CreateDate -MediaCreateDate -TrackCreateDate -OffsetTimeOriginal -OffsetTimeDigitized -Make -Model -SerialNumber -Encoder -Software -FirmwareVersion FILE
 ```
 
 To list every date of the file with the group it comes from:
@@ -58,10 +58,10 @@ Devices are stored in `conf/devices.json` (see the README for the format). Back 
 
 | Problem | Fix |
 | --- | --- |
-| Wrong label in the names | Change `label`. Already renamed files keep their old names; run again to rename them (the pattern must still match). |
+| Wrong device name in the file names | Change `id`. Already renamed files keep their old names; run again to rename them (the pattern must still match). |
 | A typo was entered when the device was registered | Edit the entry, or restore `conf/devices.json.bak` (the version before the last run that registered devices). |
 | Files go to the wrong device | Entries are tried in file order and the first match wins: move the more specific entry (with `make` and `serial_number`) above the generic one. |
-| Two bodies of the same model need different labels or offsets | Add `serial_number` to each entry's `match`. Files without a serial number (many videos) only match entries whose `model`/`make` match, so keep a generic entry last for them. |
+| Two bodies of the same model need different ids or offsets | Add `serial_number` to each entry's `match`. Files without a serial number (many videos) only match entries whose `model`/`make` match, so keep a generic entry last for them. |
 | A device is asked again at every run | Its `Make`/`Model` in the files differ from `match`: compare them with [Inspect a file's tags](#inspect-a-files-tags). Comparisons ignore case and extra spaces, not other differences. |
 | `duplicate id (already used by device #N)` | Each `id` must be unique (case-insensitive); rename one of them. |
 | Start over for a device | Delete its entry: the program asks again at the next run. |
@@ -99,7 +99,7 @@ Without a zone, names use the camera's wall-clock time, marked `local` in the pr
 
 | Symptom | Explanation / fix |
 | --- | --- |
-| Videos are a few hours off compared with photos | QuickTime dates are UTC in theory, but many cameras (GoPro included) write local time. They are treated as local. If a camera really writes UTC, set its `timezone` to `UTC`; otherwise correct it with its `offset`. |
+| Videos are a few hours off compared with photos | QuickTime dates are UTC in theory, but many cameras (GoPro included) write local time. They are treated as local. If a camera really writes UTC (e.g. DJI Osmo Action), set its `timezone` to `UTC`; otherwise correct it with its `offset`. |
 | Some files are `UTC`, others `local` in one batch | Files with a stored UTC offset (`OffsetTime*` tags, many phones) are always converted; give `--tz` or the device `timezone` so the others are converted too. |
 | `... occurs twice (clocks set back) in Europe/Paris: local time kept` | The local time exists twice on the night clocks go back; it cannot be converted reliably. The file keeps its local time; rename it by hand if needed. |
 | `... does not exist (clocks set forward) ...` | Same, for the hour skipped when clocks go forward (usually a wrong camera clock). |
@@ -115,7 +115,7 @@ Without a zone, names use the camera's wall-clock time, marked `local` in the pr
 | --- | --- |
 | Burst photos get `_01`, `_02` | Several shots in the same second: the pattern has a one-second resolution. Expected; add `{ORIGINAL}` to the pattern to keep them apart. |
 | Photos from two cameras collide | Add `{DEVICE}` to the pattern (it is in the default one). |
-| A second run adds `_01` to files already renamed | Not expected: a file whose name is already its target is `unchanged`. Check that the device label, offset, zone and pattern did not change between runs. |
+| A second run adds `_01` to files already renamed | Not expected: a file whose name is already its target is `unchanged`. Check that the device id, offset, zone and pattern did not change between runs. |
 | Files with only a case difference (`a.JPG` / `A.jpg`) get suffixes | They would overwrite each other on Windows and macOS, so they are kept apart on every system. |
 | Two long names get `_01` although their originals differ | Rendered names are cut to 200 UTF-8 bytes; when `{ORIGINAL}` is long, the end that differs may be cut. Shorten the pattern or the original names. |
 | `NotADirectoryError: a file stands where a folder is needed` | With `--dest`, a file in the destination has the name of a subfolder to create. Rename or move that file. |
@@ -132,7 +132,7 @@ Files in different folders never collide with each other: each folder (or each d
 - invalid JSON (missing comma or quote, trailing comma): the message gives the line and column;
 - unknown token in `filename_pattern` (only `{YYYY}` `{MM}` `{DD}` `{HH}` `{MIN}` `{SEC}` `{DEVICE}` `{ORIGINAL}`), path separators or invalid characters;
 - an extension without a leading dot, or an unknown `log_level`;
-- an offset not in signed `HH:MM:SS` form (minutes and seconds `00`–`59`), a duplicate device `id`, a `match` without `make` or `model`, a label with invalid file name characters or a leading/trailing space or dot, an unknown field.
+- an offset not in signed `HH:MM:SS` form (minutes and seconds `00`–`59`), a duplicate device `id`, a `match` without `make` or `model`, an empty id, or one with invalid file name characters or a leading/trailing space or dot, a label that is not a string, an unknown field.
 
 If a personal file is beyond repair, restore your backup or reset it from its template (see "Back up your personal files" in the README).
 
@@ -140,7 +140,7 @@ If a personal file is beyond repair, restore your backup or reset it from its te
 
 | Message | Meaning |
 | --- | --- |
-| `no main video with the same base name in its folder; not renamed` | A GoPro `.LRV`/`.THM`/`.WAV` without its `.MP4`/`.MOV` in the same folder. Process the folder that holds both, or rename it by hand. |
+| `no main video with the same base name in its folder; not renamed` | A GoPro `.LRV`/`.THM`/`.WAV` or DJI `.LRF`/`.WAV` without its `.MP4`/`.MOV` in the same folder. Process the folder that holds both, or rename it by hand. |
 | `main video ... is skipped; not renamed` | The auxiliary file follows a video that has no valid date or device: fix the video first. |
 | `another .LRV file already follows ...; not renamed` | Two auxiliary files of the same type (e.g. `GH011892.LRV` and `GL011892.LRV`) match one video: only the first one, in name order, follows it. Rename the other by hand or remove the duplicate. |
 | `[WARNING] Log file disabled: cannot write ...` | `.logs/` is not writable; the run continues without a log. |

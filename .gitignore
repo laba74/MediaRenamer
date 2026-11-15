@@ -1,6 +1,9 @@
 # ExifTool binaries are installed manually and retain their own licensing.
 /bin/
 
+# Offline wheelhouse built by scripts/build_offline_wheels.ps1
+/wheels/
+
 # Runtime logs
 /.logs/
 
